@@ -27,5 +27,9 @@ class TestEdginghockeyscraper(unittest.TestCase):
         assert(len(games) == 1312)
 
     def test_getBoxscore(self):
-        boxscore = edginghockeyscraper.get_boxscore(2024020345,cache= True)
+        boxscore = edginghockeyscraper.get_boxscore(2024020345, cache= True)
         assert(boxscore is not None)
+
+    def test_playByPlay(self):
+        playByPlay = edginghockeyscraper.get_play_by_play(2024020345, cache= True)
+        assert (playByPlay is not None)
