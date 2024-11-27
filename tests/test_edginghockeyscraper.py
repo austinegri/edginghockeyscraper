@@ -25,3 +25,7 @@ class TestEdginghockeyscraper(unittest.TestCase):
     def test_getLeagueSchedule_regGames(self):
         games = edginghockeyscraper.get_league_schedule(2024, {GameType.REG}, cache= True)
         assert(len(games) == 1312)
+
+    def test_getBoxscore(self):
+        boxscore = edginghockeyscraper.get_boxscore(2024020345,cache= True)
+        assert(boxscore is not None)

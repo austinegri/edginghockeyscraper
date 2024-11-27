@@ -32,3 +32,8 @@ def get_league_schedule(season: int, gameTypes: set[GameType] = {GameType.PRE, G
 
     return games
 
+def get_boxscore(gameId: int, cache= False) -> dict:
+    BOXSCORE_URL = 'https://api-web.nhle.com/v1/gamecenter/{}/boxscore'.format(gameId)
+    session = get_session(cache)
+
+    return session.get(BOXSCORE_URL).json()
