@@ -37,3 +37,9 @@ def get_boxscore(gameId: int, cache= False) -> dict:
     session = get_session(cache)
 
     return session.get(BOXSCORE_URL).json()
+
+def get_play_by_play(gameId: int, cache= False) -> dict:
+    PLAY_BY_PLAY_URL = 'https://api-web.nhle.com/v1/gamecenter/{}/play-by-play'.format(gameId)
+    session = get_session(cache)
+
+    return session.get(PLAY_BY_PLAY_URL).json()
