@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=62.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "edginghockeyscraper"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python Hockey Data Scraper"
 readme = "README.rst"
 authors = [
@@ -17,9 +17,9 @@ classifiers = [
 
 ]
 license = {text = "MIT license"}
-dependencies = [
-  
-]
+dynamic = ["dependencies"]
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
 dev = [
@@ -60,4 +60,3 @@ warn_no_return = true
 module = "tests.*"
 allow_untyped_defs = true
 disable_error_code = "attr-defined"
-
