@@ -1,5 +1,4 @@
 """Main module."""
-import json
 from datetime import date
 
 from .data.schedule_data import GameType
@@ -44,7 +43,12 @@ def get_play_by_play(gameId: int, cache= False) -> dict:
 
 def get_boxscore_season(season: int, gameTypes: set[GameType] = {GameType.PRE, GameType.REG, GameType.POST}, cache= False) -> [dict]:
     schedule = get_league_schedule(season, gameTypes, cache)
-    print([(game['id'], cache) for game in schedule])
 
     with Pool() as p:
         return p.starmap(get_boxscore, [(game['id'], cache) for game in schedule])
+
+def get_play_by_play_season(season: int, gameTypes: set[GameType] = {GameType.PRE, GameType.REG, GameType.POST}, cache= False) -> [dict]:
+    schedule = get_league_schedule(season, gameTypes, cache)
+
+    with Pool() as p:
+        return p.starmap(get_play_by_play, [(game['id'], cache) for game in schedule])
