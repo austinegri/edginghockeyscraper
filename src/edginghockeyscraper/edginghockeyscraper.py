@@ -1,8 +1,11 @@
 """Main module."""
+import json
 from datetime import date
 
 from .data.schedule_data import GameType
 from .util.util import get_session
+
+from multiprocessing import Pool
 
 
 def get_league_schedule(season: int, gameTypes: set[GameType] = {GameType.PRE, GameType.REG, GameType.POST}, cache= False) -> list[dict]:
@@ -38,3 +41,10 @@ def get_play_by_play(gameId: int, cache= False) -> dict:
     session = get_session(cache)
 
     return session.get(PLAY_BY_PLAY_URL).json()
+
+def get_boxscore_season(season: int, gameTypes: set[GameType] = {GameType.PRE, GameType.REG, GameType.POST}, cache= False) -> [dict]:
+    schedule = get_league_schedule(season, gameTypes, cache)
+    print([(game['id'], cache) for game in schedule])
+
+    with Pool() as p:
+        return p.starmap(get_boxscore, [(game['id'], cache) for game in schedule])

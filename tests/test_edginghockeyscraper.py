@@ -36,3 +36,7 @@ class TestEdginghockeyscraper(unittest.TestCase):
     def test_playByPlay(self):
         playByPlay = edginghockeyscraper.get_play_by_play(2024020345, cache= True)
         self.assertIsNotNone(playByPlay)
+
+    def test_getBoxscoreSeason(self):
+        boxscoreSeason = edginghockeyscraper.get_boxscore_season(2024, gameTypes= {GameType.REG}, cache= True)
+        self.assertEqual(len(boxscoreSeason), 1312)
