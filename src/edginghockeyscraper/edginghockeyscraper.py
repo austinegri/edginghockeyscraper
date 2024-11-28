@@ -1,14 +1,9 @@
 """Main module."""
 from datetime import date
-import requests_cache
-import requests
 
-from src.edginghockeyscraper.data.schedule_data import GameType
+from .data.schedule_data import GameType
+from .util.util import get_session
 
-def get_session(cache):
-    if cache:
-        return requests_cache.CachedSession('nhl_cache')
-    return requests.Session()
 
 def get_league_schedule(season: int, gameTypes: set[GameType] = {GameType.PRE, GameType.REG, GameType.POST}, cache= False) -> list[dict]:
     gameTypes = set([gameType.value for gameType in gameTypes]) # hack to check valid gameTypes bc was getting issue testing with gameTypes={GameType.REG}
