@@ -1,13 +1,13 @@
 """Main module."""
 from datetime import date
 
-from .data.schedule_data import GameType
+from .data.schedule_data import GameType, REG_POST_GAME_TYPES
 from .util.util import get_session
 
 from multiprocessing import Pool
 
 
-def get_league_schedule(season: int, gameTypes: set[GameType] = {GameType.PRE, GameType.REG, GameType.POST}, cache= False) -> list[dict]:
+def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache= False) -> list[dict]:
     gameTypes = set([gameType.value for gameType in gameTypes]) # hack to check valid gameTypes bc was getting issue testing with gameTypes={GameType.REG}
     SCHEDULE_URL = 'https://api-web.nhle.com/v1/schedule/{}'
     nextStartDate = '{}-07-01'.format(season - 1)
@@ -41,13 +41,13 @@ def get_play_by_play(gameId: int, cache= False) -> dict:
 
     return session.get(PLAY_BY_PLAY_URL).json()
 
-def get_boxscore_season(season: int, gameTypes: set[GameType] = {GameType.PRE, GameType.REG, GameType.POST}, cache= False) -> [dict]:
+def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache= False) -> [dict]:
     schedule = get_league_schedule(season, gameTypes, cache)
 
     with Pool() as p:
         return p.starmap(get_boxscore, [(game['id'], cache) for game in schedule])
 
-def get_play_by_play_season(season: int, gameTypes: set[GameType] = {GameType.PRE, GameType.REG, GameType.POST}, cache= False) -> [dict]:
+def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache= False) -> [dict]:
     schedule = get_league_schedule(season, gameTypes, cache)
 
     with Pool() as p:

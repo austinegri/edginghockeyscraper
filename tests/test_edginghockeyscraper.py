@@ -23,7 +23,7 @@ class TestEdginghockeyscraper(unittest.TestCase):
 
     def test_getLeagueSchedule(self):
         games = edginghockeyscraper.get_league_schedule(2024, cache= True)
-        self.assertEqual(len(games), 1560)
+        self.assertEqual(len(games), 1400)
 
     def test_getLeagueSchedule_regGames(self):
         games = edginghockeyscraper.get_league_schedule(2024, {GameType.REG}, cache= True)
