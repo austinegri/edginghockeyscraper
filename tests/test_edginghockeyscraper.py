@@ -37,6 +37,10 @@ class TestEdginghockeyscraper(unittest.TestCase):
         playByPlay = edginghockeyscraper.get_play_by_play(2024020345, cache= True)
         self.assertIsNotNone(playByPlay)
 
+    def test_getShifts(self):
+        shifts = edginghockeyscraper.get_shifts(2024020345, cache= True)
+        self.assertIsNotNone(shifts)
+
     def test_getBoxscoreSeason(self):
         boxscoreSeason = edginghockeyscraper.get_boxscore_season(2024, gameTypes= {GameType.REG}, cache= True)
         self.assertEqual(len(boxscoreSeason), 1312)
@@ -44,3 +48,7 @@ class TestEdginghockeyscraper(unittest.TestCase):
     def test_getPlayByPlaySeason(self):
         playByPlaySeason = edginghockeyscraper.get_play_by_play_season(2024, gameTypes= {GameType.REG}, cache= True)
         self.assertEqual(len(playByPlaySeason), 1312)
+
+    def test_getShiftsSeason(self):
+        shiftsSeason = edginghockeyscraper.get_shifts_season(2024, gameTypes= {GameType.REG}, cache= True)
+        self.assertEqual(len(shiftsSeason), 1312)

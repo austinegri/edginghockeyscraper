@@ -41,6 +41,12 @@ def get_play_by_play(gameId: int, cache= False) -> dict:
 
     return session.get(PLAY_BY_PLAY_URL).json()
 
+def get_shifts(gameId: int, cache= False) -> dict:
+    SHIFTS_URL = 'https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={}'.format(gameId)
+    session = get_session(cache)
+
+    return session.get(SHIFTS_URL).json()
+
 def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache= False) -> [dict]:
     schedule = get_league_schedule(season, gameTypes, cache)
 
@@ -52,3 +58,9 @@ def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAM
 
     with Pool() as p:
         return p.starmap(get_play_by_play, [(game['id'], cache) for game in schedule])
+
+def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache= False) -> [dict]:
+    schedule = get_league_schedule(season, gameTypes, cache)
+
+    with Pool() as p:
+        return p.starmap(get_shifts, [(game['id'], cache) for game in schedule])
