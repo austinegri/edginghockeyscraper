@@ -5,11 +5,10 @@
 
 import unittest
 
+from requests_cache import CachedSession
+
 from src.edginghockeyscraper import edginghockeyscraper
 from src.edginghockeyscraper.data.schedule_data import GameType
-
-# from edginghockeyscraper import edginghockeyscraper
-# from data.schedule_data import GameType
 
 
 class TestEdginghockeyscraper(unittest.TestCase):
@@ -23,6 +22,11 @@ class TestEdginghockeyscraper(unittest.TestCase):
 
     def test_getLeagueSchedule(self):
         games = edginghockeyscraper.get_league_schedule(2024, cache= True)
+        self.assertEqual(len(games), 1400)
+
+    def test_getLeagueSchedule_customCache(self):
+        session = CachedSession('nhl_cache2')
+        games = edginghockeyscraper.get_league_schedule(2024, cache= session)
         self.assertEqual(len(games), 1400)
 
     def test_getLeagueSchedule_regGames(self):
