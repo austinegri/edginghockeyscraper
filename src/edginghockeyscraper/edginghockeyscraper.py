@@ -1,6 +1,7 @@
 """Main module."""
 from __future__ import annotations
 
+from calendar import month
 from datetime import date
 
 from requests_cache import CachedSession
@@ -10,6 +11,13 @@ from .util.util import get_session
 
 from multiprocessing import Pool
 
+def get_league_year_by_date(given_date: date) -> int:
+    if given_date >= date(year= given_date.year, month= 7, day= 1):
+        return given_date.year + 1
+    return given_date.year
+
+def get_current_NHL_year() -> int:
+    return get_league_year_by_date(date.today())
 
 def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache: bool | CachedSession = False) -> list[dict]:
     gameTypes = set([gameType.value for gameType in gameTypes]) # hack to check valid gameTypes bc was getting issue testing with gameTypes={GameType.REG}
