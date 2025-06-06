@@ -1,7 +1,6 @@
 """Main module."""
 from __future__ import annotations
 
-from calendar import month
 from datetime import date
 
 from requests_cache import CachedSession
@@ -18,6 +17,56 @@ def get_league_year_by_date(given_date: date) -> int:
 
 def get_current_NHL_year() -> int:
     return get_league_year_by_date(date.today())
+
+def get_player_info(playerId: int, cache: bool | CachedSession = False) -> dict:
+    """
+    Returns:
+    - response (dict): A dictionary containing the scraped player data.
+
+    Data in dict :
+    - playerId
+    - isActive
+    - currentTeamId
+    - currentTeamAbbrev
+    - fullTeamName
+    - teamCommonName
+    - teamPlaceNameWithPreposition
+    - firstName
+    - lastName
+    - teamLogo
+    - sweaterNumber
+    - position
+    - headshot
+    - heroImage
+    - heightInInches
+    - heightInCentimeters
+    - weightInPounds
+    - weightInKilograms
+    - birthDate
+    - birthCity
+    - birthStateProvince
+    - birthCountry
+    - shootsCatches
+    - draftDetails
+    - playerSlug
+    - inTop100AllTime
+    - inHHOF
+    - featuredStats
+    - careerTotals
+    - shopLink
+    - twitterLink
+    - watchLink
+    - last5Games
+    - seasonTotals
+    - currentTeamRoster
+    """
+
+    url = 'https://api-web.nhle.com/v1/player/{}/landing'
+    session = get_session(cache)
+    return session.get(url.format(playerId)).json()
+
+def get_player_position(playerId: int, cache: bool | CachedSession = False) -> str:
+    return get_player_info(playerId, cache)['position']
 
 def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache: bool | CachedSession = False) -> list[dict]:
     gameTypes = set([gameType.value for gameType in gameTypes]) # hack to check valid gameTypes bc was getting issue testing with gameTypes={GameType.REG}

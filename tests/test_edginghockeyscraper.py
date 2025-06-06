@@ -33,6 +33,18 @@ class TestEdginghockeyscraper(unittest.TestCase):
         year = edginghockeyscraper.get_current_NHL_year()
         self.assertEqual(year, edginghockeyscraper.get_league_year_by_date(date.today()))
 
+    def test_getPlayerInfo(self):
+        info = edginghockeyscraper.get_player_info(8479420, True)
+        self.assertIsNotNone(info)
+
+    def test_getPlayerPosition(self):
+        pos = edginghockeyscraper.get_player_position(8479420, True)
+        self.assertEqual(pos, 'C')
+
+    def test_getPlayerPosition_goalie(self):
+        pos = edginghockeyscraper.get_player_position(8447687, True)
+        self.assertEqual(pos, 'G')
+
     def test_getLeagueSchedule(self):
         games = edginghockeyscraper.get_league_schedule(2024, cache=True)
         self.assertEqual(len(games), 1400)
