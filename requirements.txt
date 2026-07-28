@@ -1,8 +1,14 @@
-pip>=24.3.1
-wheel>=0.45.1
-twine==5.1.1
-setuptools>=62.6.0
+pip>=26.0.1
+wheel>=0.47.0
+twine==6.2.0
+setuptools>=82.0.1
 
+<<<<<<< HEAD
 requests-cache~=1.2.1
 requests~=2.32.3
 tqdm~=4.0
+=======
+requests-cache~=1.3.3
+requests~=2.32.5
+tqdm~=4.70.0
+>>>>>>> aeb9191 (Add progress bars, retry logic, and browser headers for season fetches)
