@@ -198,7 +198,7 @@ def get_shifts(gameId: int, game_date: date | None = None, disable_cache: bool =
     session = get_session(game_date, disable_cache)
     return session.get(SHIFTS_URL).json()
 
-def add_on_ice_players_to_play_by_play(
+def get_on_ice_players_with_play_by_play(
     game_id: int,
     game_date: date | None = None,
     disable_cache: bool = False,

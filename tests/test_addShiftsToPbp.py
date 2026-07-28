@@ -272,7 +272,7 @@ class TestAttachOnIcePlayers(unittest.TestCase):
         )
         self.addCleanup(patcher.stop)
         patcher.start()
-        self.result = edginghockeyscraper.add_on_ice_players_to_play_by_play(GAME_ID)
+        self.result = edginghockeyscraper.get_on_ice_players_with_play_by_play(GAME_ID)
         self.plays = self.result["plays"]
 
     def test_returns_all_plays_with_onice_key(self):
@@ -385,7 +385,7 @@ class TestAttachOnIcePlayers(unittest.TestCase):
 if __name__ == "__main__":
     # unittest.main()
     GAME_ID = 2022020001
-    enriched = edginghockeyscraper.add_on_ice_players_to_play_by_play(GAME_ID)
+    enriched = edginghockeyscraper.get_on_ice_players_with_play_by_play(GAME_ID)
 
     for play in enriched["plays"]:
         onice = play["onIce"]
