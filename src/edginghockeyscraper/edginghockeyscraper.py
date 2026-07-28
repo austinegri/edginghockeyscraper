@@ -1,14 +1,109 @@
 """Main module."""
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date
+from typing import Tuple, Dict, List, Optional
 
 from requests_cache import CachedSession
 
 from .data.schedule_data import GameType, REG_POST_GAME_TYPES
+from .dataclass.player import Player
 from .util.util import get_session
 
 from multiprocessing import Pool
+
+def _mmss_to_seconds(t: str) -> int:
+    """'MM:SS' -> total seconds elapsed in the period."""
+    mins, secs = t.split(":")
+    return int(mins) * 60 + int(secs)
+
+
+def _load_goalie_ids(boxscore: dict) -> Tuple[set, set]:
+    """Return (home_goalie_ids, away_goalie_ids) from the boxscore feed."""
+    stats = boxscore.get("playerByGameStats", {})
+    home_g = {p["playerId"] for p in stats.get("homeTeam", {}).get("goalies", [])}
+    away_g = {p["playerId"] for p in stats.get("awayTeam", {}).get("goalies", [])}
+    return home_g, away_g
+
+
+def _build_period_shifts(shifts_json: dict) -> Dict[int, List[dict]]:
+    """
+    Group valid shifts by period, normalized to seconds-elapsed-in-period.
+
+    Skips rows with missing player/time/team data, and rows with
+    end <= start (the shift feed contains a handful of zero/negative
+    duration bookkeeping rows, e.g. period-end / game-end markers, that
+    aren't real shifts).
+    """
+    per_period: Dict[int, List[dict]] = defaultdict(list)
+    for row in shifts_json.get("data", []):
+        pid = row.get("playerId")
+        period = row.get("period")
+        start = row.get("startTime")
+        end = row.get("endTime")
+        team_id = row.get("teamId")
+        if pid is None or period is None or not start or not end or team_id is None:
+            continue
+
+        start_s = _mmss_to_seconds(start)
+        end_s = _mmss_to_seconds(end)
+        if end_s <= start_s:
+            continue
+
+        per_period[period].append(
+            {"playerId": pid, "teamId": team_id, "start": start_s, "end": end_s}
+        )
+    return per_period
+
+
+def _sweep_period(
+    shifts: List[dict], events: List[Tuple[int, int, bool]]
+) -> Dict[int, Dict[int, int]]:
+    """
+    Sweep-line over a single period.
+
+    shifts: list of {"playerId", "teamId", "start", "end"} for that period.
+    events: list of (original_index, time_in_seconds, is_stoppage), for that period,
+            SORTED by time_in_seconds.
+
+    Returns {original_index: {playerId: teamId}} -- the players on the ice
+    at each event's timestamp.
+
+    Stoppage semantics: the NHL shift feed truncates every on-ice player's shift
+    at the stoppage timestamp (goal, penalty, icing, etc.), so a naive `<= t`
+    sweep would remove them before snapshotting the event.  For stoppage events
+    (identified by the next play being a faceoff) we therefore advance the sweep
+    only up to (but not including) t, keeping those players in the active set.
+    """
+    changes = []
+    for s in shifts:
+        changes.append((s["start"], 1, s["playerId"], s["teamId"]))   # joins
+        changes.append((s["end"], -1, s["playerId"], s["teamId"]))    # leaves
+    # Stable time-ordering; ties between a "leave" and "join" at the same
+    # instant don't matter here since they involve different players and
+    # the active dict is keyed by playerId.
+    changes.sort(key=lambda c: c[0])
+
+    active: Dict[int, int] = {}          # playerId -> teamId, "on ice now"
+    result: Dict[int, Dict[int, int]] = {}
+    ci, n = 0, len(changes)
+
+    for orig_idx, t, is_stoppage in events:
+        # Stoppages: process changes strictly before t so players whose shifts
+        # end exactly at the stoppage time are still counted as on-ice.
+        # All other events: include changes at exactly t (normal end-exclusive semantics).
+        cutoff = t if not is_stoppage else t - 1
+        while ci < n and changes[ci][0] <= cutoff:
+            _, delta, pid, tid = changes[ci]
+            if delta == 1:
+                active[pid] = tid
+            else:
+                active.pop(pid, None)
+            ci += 1
+        result[orig_idx] = dict(active)  # snapshot; don't leak a live reference
+    return result
+
 
 def get_league_year_by_date(given_date: date) -> int:
     if given_date >= date(year= given_date.year, month= 7, day= 1):
@@ -107,6 +202,89 @@ def get_shifts(gameId: int, cache: bool | CachedSession = False) -> dict:
     session = get_session(cache)
 
     return session.get(SHIFTS_URL).json()
+
+def add_on_ice_players_to_play_by_play(game_id: int, cache: bool | CachedSession = False) -> dict:
+    """
+    Fetch shift, play-by-play, and boxscore data for `game_id`, and return
+    the play-by-play payload with an added 'onIce' block on every play:
+
+        play["onIce"] = {
+            "homeSkaters": [Player, ...],   # no goalie, no duplicates
+            "awaySkaters": [Player, ...],
+            "homeGoalie": Player or None,    # None => net empty / no goalie found
+            "awayGoalie": Player or None,
+        }
+    """
+    shifts_json = get_shifts(game_id, cache)
+    pbp = get_play_by_play(game_id, cache)
+    boxscore = get_boxscore(game_id, cache)
+
+    home_team_id = pbp["homeTeam"]["id"]
+    away_team_id = pbp["awayTeam"]["id"]
+    home_goalies, away_goalies = _load_goalie_ids(boxscore)
+
+    period_shifts = _build_period_shifts(shifts_json)
+
+    # Resolve every unique player ID that appears in the shifts to a Player object.
+    all_player_ids = {s["playerId"] for shifts in period_shifts.values() for s in shifts}
+    players: Dict[int, Player] = {}
+    for pid in all_player_ids:
+        info = get_player_info(pid, cache)
+        first = info.get("firstName", {}).get("default", "")
+        last = info.get("lastName", {}).get("default", "")
+        players[pid] = Player(
+            playerId=pid,
+            name=f"{first} {last}".strip(),
+            position=info.get("position", ""),
+        )
+
+    # Bucket play-by-play events by period, keeping their original index
+    # so results can be written back in-place afterward.
+    plays = pbp.get("plays", [])
+    events_by_period: Dict[int, List[Tuple[int, int, bool]]] = defaultdict(list)
+    for i, play in enumerate(plays):
+        period = play.get("periodDescriptor", {}).get("number")
+        t = play.get("timeInPeriod")
+        if period is None or not t:
+            continue
+        next_play = plays[i + 1] if i + 1 < len(plays) else None
+        is_stoppage = (next_play or {}).get("typeDescKey") == "faceoff"
+        events_by_period[period].append((i, _mmss_to_seconds(t), is_stoppage))
+
+    onice_by_index: Dict[int, Dict[int, int]] = {}
+    for period, evs in events_by_period.items():
+        evs.sort(key=lambda e: e[1])  # sweep requires chronological order
+        shifts = period_shifts.get(period, [])
+        onice_by_index.update(_sweep_period(shifts, evs))
+
+    for i, play in enumerate(plays):
+        active = onice_by_index.get(i, {})
+        home_skaters: List[Player] = []
+        away_skaters: List[Player] = []
+        home_goalie: Optional[Player] = None
+        away_goalie: Optional[Player] = None
+
+        for pid, tid in active.items():
+            player = players.get(pid, Player(playerId=pid, name="", position=""))
+            if tid == home_team_id:
+                if pid in home_goalies:
+                    home_goalie = player
+                else:
+                    home_skaters.append(player)
+            elif tid == away_team_id:
+                if pid in away_goalies:
+                    away_goalie = player
+                else:
+                    away_skaters.append(player)
+
+        play["onIce"] = {
+            "homeSkaters": sorted(home_skaters),
+            "awaySkaters": sorted(away_skaters),
+            "homeGoalie": home_goalie,
+            "awayGoalie": away_goalie,
+        }
+
+    return pbp
 
 def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache: bool | CachedSession = False) -> [dict]:
     schedule = get_league_schedule(season, gameTypes, cache)
