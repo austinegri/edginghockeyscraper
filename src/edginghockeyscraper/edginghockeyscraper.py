@@ -9,7 +9,9 @@ from .data.schedule_data import GameType, REG_POST_GAME_TYPES
 from .dataclass.player import Player
 from .util.util import get_session
 
-from multiprocessing import Pool
+from tqdm.contrib.concurrent import process_map
+
+_CHUNK_SIZE = 1
 
 def _mmss_to_seconds(t: str) -> int:
     """'MM:SS' -> total seconds elapsed in the period."""
@@ -168,7 +170,9 @@ def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TY
     nextYear, nextMonth, nextDay = nextStartDate.split('-')
     endDate = date(season, 7, 1)
 
-    session = get_session(disable_cache=disable_cache)
+    # Use the season-end date as a proxy so completed seasons are cached.
+    season_end = date(season, 7, 1)
+    session = get_session(game_date=season_end, disable_cache=disable_cache)
     schedule = session.get(SCHEDULE_URL.format(nextStartDate)).json()
 
     games = []
@@ -301,34 +305,29 @@ def _game_date_from_entry(game: dict) -> date | None:
     raw = game.get('gameDate')
     return date.fromisoformat(raw) if raw else None
 
+def _season_args(schedule: list[dict], disable_cache: bool) -> tuple[list, list, list]:
+    ids = [game['id'] for game in schedule]
+    dates = [_game_date_from_entry(game) for game in schedule]
+    flags = [disable_cache] * len(schedule)
+    return ids, dates, flags
+
+
 def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
     schedule = get_league_schedule(season, gameTypes, disable_cache)
-    with Pool() as p:
-        return p.starmap(get_boxscore, [
-            (game['id'], _game_date_from_entry(game), disable_cache)
-            for game in schedule
-        ])
+    ids, dates, flags = _season_args(schedule, disable_cache)
+    return process_map(get_boxscore, ids, dates, flags, chunksize=_CHUNK_SIZE, desc=f"Boxscores {season}")
 
 def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
     schedule = get_league_schedule(season, gameTypes, disable_cache)
-    with Pool() as p:
-        return p.starmap(get_play_by_play, [
-            (game['id'], _game_date_from_entry(game), disable_cache)
-            for game in schedule
-        ])
+    ids, dates, flags = _season_args(schedule, disable_cache)
+    return process_map(get_play_by_play, ids, dates, flags, chunksize=_CHUNK_SIZE, desc=f"Play-by-play {season}")
 
 def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
     schedule = get_league_schedule(season, gameTypes, disable_cache)
-    with Pool() as p:
-        return p.starmap(get_shifts, [
-            (game['id'], _game_date_from_entry(game), disable_cache)
-            for game in schedule
-        ])
+    ids, dates, flags = _season_args(schedule, disable_cache)
+    return process_map(get_shifts, ids, dates, flags, chunksize=_CHUNK_SIZE, desc=f"Shifts {season}")
 
 def get_on_ice_players_with_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
     schedule = get_league_schedule(season, gameTypes, disable_cache)
-    with Pool() as p:
-        return p.starmap(get_on_ice_players_with_play_by_play, [
-            (game['id'], _game_date_from_entry(game), disable_cache)
-            for game in schedule
-        ])
+    ids, dates, flags = _season_args(schedule, disable_cache)
+    return process_map(get_on_ice_players_with_play_by_play, ids, dates, flags, chunksize=_CHUNK_SIZE, desc=f"On-ice PBP {season}")

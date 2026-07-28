@@ -4,10 +4,41 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from requests_cache import CachedSession
 
 _CACHE_PATH = Path.home() / '.edginghockeyscraper' / 'nhl_cache'
 _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+_RETRY = Retry(
+    total=5,
+    backoff_factor=.2,
+    status_forcelist={429, 500, 502, 503, 504},
+    allowed_methods={"GET"},
+    raise_on_status=False,
+)
+
+_BACKEND = 'sqlite'
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nhl.com/",
+}
+
+
+def _prepare_session(session: requests.Session) -> requests.Session:
+    adapter = HTTPAdapter(max_retries=_RETRY)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(_HEADERS)
+    return session
 
 
 def get_session(
@@ -38,21 +69,24 @@ def get_session(
                                 days_since_game measured from now).
     """
     if disable_cache or game_date is None:
-        return requests.Session()
+        return _prepare_session(requests.Session())
 
     today = date.today()
     days_delta = (game_date - today).days  # positive = future, negative = past
+    expire_after = None
 
     if days_delta >= 0:
         # Future or today
         if days_delta <= 1:
-            return requests.Session()
-        return CachedSession(str(_CACHE_PATH), expire_after=timedelta(days=days_delta - 1))
+            return _prepare_session(requests.Session())
+        expire_after = timedelta(days=days_delta - 1)
 
     # Past game
     days_since_game = -days_delta
     if days_since_game > 365:
         expire_after = timedelta(days=365)
-    else:
+    elif expire_after is None:
         expire_after = timedelta(days=days_since_game)
-    return CachedSession(str(_CACHE_PATH), expire_after=expire_after)
+    session = CachedSession(str(_CACHE_PATH), backend=_BACKEND, expire_after=expire_after)
+    _prepare_session(session)
+    return session

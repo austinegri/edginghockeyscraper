@@ -387,12 +387,9 @@ class TestAttachOnIcePlayers(unittest.TestCase):
 # Season-level integration test
 # ---------------------------------------------------------------------------
 
-class _SyncPool:
-    """Drop-in Pool replacement that runs starmap synchronously (no subprocesses)."""
-    def __enter__(self): return self
-    def __exit__(self, *_): pass
-    def starmap(self, fn, args):
-        return [fn(*a) for a in args]
+def _sync_process_map(fn, ids, dates, flags, **kwargs):
+    """Drop-in process_map replacement that runs synchronously (no subprocesses)."""
+    return [fn(i, d, f) for i, d, f in zip(ids, dates, flags)]
 
 
 class TestGetOnIcePlayersWithPlayByPlaySeason(unittest.TestCase):
@@ -409,8 +406,8 @@ class TestGetOnIcePlayersWithPlayByPlaySeason(unittest.TestCase):
             'src.edginghockeyscraper.edginghockeyscraper.get_league_schedule',
             return_value=self._FAKE_SCHEDULE,
         ), patch(
-            'src.edginghockeyscraper.edginghockeyscraper.Pool',
-            _SyncPool,
+            'src.edginghockeyscraper.edginghockeyscraper.process_map',
+            side_effect=_sync_process_map,
         ), patch(
             'src.edginghockeyscraper.edginghockeyscraper.get_on_ice_players_with_play_by_play',
             return_value=self._FAKE_RESULT,

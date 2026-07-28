@@ -5,3 +5,4 @@ setuptools>=62.6.0
 
 requests-cache~=1.2.1
 requests~=2.32.3
+tqdm~=4.0
