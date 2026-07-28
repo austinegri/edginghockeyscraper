@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from pathlib import Path
 
 import requests
 from requests_cache import CachedSession
+
+_CACHE_PATH = Path.home() / '.edginghockeyscraper' / 'nhl_cache'
+_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_session(
@@ -43,7 +47,7 @@ def get_session(
         # Future or today
         if days_delta <= 1:
             return requests.Session()
-        return CachedSession('nhl_cache', expire_after=timedelta(days=days_delta - 1))
+        return CachedSession(str(_CACHE_PATH), expire_after=timedelta(days=days_delta - 1))
 
     # Past game
     days_since_game = -days_delta
@@ -51,4 +55,4 @@ def get_session(
         expire_after = timedelta(days=365)
     else:
         expire_after = timedelta(days=days_since_game)
-    return CachedSession('nhl_cache', expire_after=expire_after)
+    return CachedSession(str(_CACHE_PATH), expire_after=expire_after)
