@@ -5,8 +5,6 @@ from collections import defaultdict
 from datetime import date
 from typing import Tuple, Dict, List, Optional
 
-from requests_cache import CachedSession
-
 from .data.schedule_data import GameType, REG_POST_GAME_TYPES
 from .dataclass.player import Player
 from .util.util import get_session
@@ -113,7 +111,7 @@ def get_league_year_by_date(given_date: date) -> int:
 def get_current_NHL_year() -> int:
     return get_league_year_by_date(date.today())
 
-def get_player_info(playerId: int, cache: bool | CachedSession = False) -> dict:
+def get_player_info(playerId: int, game_date: date | None = None, disable_cache: bool = False) -> dict:
     """
     Returns:
     - response (dict): A dictionary containing the scraped player data.
@@ -157,20 +155,20 @@ def get_player_info(playerId: int, cache: bool | CachedSession = False) -> dict:
     """
 
     url = 'https://api-web.nhle.com/v1/player/{}/landing'
-    session = get_session(cache)
+    session = get_session(game_date, disable_cache)
     return session.get(url.format(playerId)).json()
 
-def get_player_position(playerId: int, cache: bool | CachedSession = False) -> str:
-    return get_player_info(playerId, cache)['position']
+def get_player_position(playerId: int, game_date: date | None = None, disable_cache: bool = False) -> str:
+    return get_player_info(playerId, game_date, disable_cache)['position']
 
-def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache: bool | CachedSession = False) -> list[dict]:
+def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
     gameTypes = set([gameType.value for gameType in gameTypes]) # hack to check valid gameTypes bc was getting issue testing with gameTypes={GameType.REG}
     SCHEDULE_URL = 'https://api-web.nhle.com/v1/schedule/{}'
     nextStartDate = '{}-07-01'.format(season - 1)
     nextYear, nextMonth, nextDay = nextStartDate.split('-')
     endDate = date(season, 7, 1)
 
-    session = get_session(cache)
+    session = get_session(disable_cache=disable_cache)
     schedule = session.get(SCHEDULE_URL.format(nextStartDate)).json()
 
     games = []
@@ -185,25 +183,26 @@ def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TY
 
     return games
 
-def get_boxscore(gameId: int, cache: bool | CachedSession = False) -> dict:
+def get_boxscore(gameId: int, game_date: date | None = None, disable_cache: bool = False) -> dict:
     BOXSCORE_URL = 'https://api-web.nhle.com/v1/gamecenter/{}/boxscore'.format(gameId)
-    session = get_session(cache)
-
+    session = get_session(game_date, disable_cache)
     return session.get(BOXSCORE_URL).json()
 
-def get_play_by_play(gameId: int, cache: bool | CachedSession = False) -> dict:
+def get_play_by_play(gameId: int, game_date: date | None = None, disable_cache: bool = False) -> dict:
     PLAY_BY_PLAY_URL = 'https://api-web.nhle.com/v1/gamecenter/{}/play-by-play'.format(gameId)
-    session = get_session(cache)
-
+    session = get_session(game_date, disable_cache)
     return session.get(PLAY_BY_PLAY_URL).json()
 
-def get_shifts(gameId: int, cache: bool | CachedSession = False) -> dict:
+def get_shifts(gameId: int, game_date: date | None = None, disable_cache: bool = False) -> dict:
     SHIFTS_URL = 'https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={}'.format(gameId)
-    session = get_session(cache)
-
+    session = get_session(game_date, disable_cache)
     return session.get(SHIFTS_URL).json()
 
-def add_on_ice_players_to_play_by_play(game_id: int, cache: bool | CachedSession = False) -> dict:
+def add_on_ice_players_to_play_by_play(
+    game_id: int,
+    game_date: date | None = None,
+    disable_cache: bool = False,
+) -> dict:
     """
     Fetch shift, play-by-play, and boxscore data for `game_id`, and return
     the play-by-play payload with an added 'onIce' block on every play:
@@ -214,10 +213,22 @@ def add_on_ice_players_to_play_by_play(game_id: int, cache: bool | CachedSession
             "homeGoalie": Player or None,    # None => net empty / no goalie found
             "awayGoalie": Player or None,
         }
+
+    If game_date is not provided, the play-by-play is fetched once uncached to
+    auto-detect the date, then subsequent calls use the appropriate cache policy.
+    Pass game_date explicitly (available from the schedule) to cache all requests.
     """
-    shifts_json = get_shifts(game_id, cache)
-    pbp = get_play_by_play(game_id, cache)
-    boxscore = get_boxscore(game_id, cache)
+    # Auto-detect game date from the PBP response when not supplied.
+    if game_date is None:
+        pbp = get_play_by_play(game_id, game_date=None, disable_cache=disable_cache)
+        raw_date = pbp.get("gameDate")
+        if raw_date:
+            game_date = date.fromisoformat(raw_date)
+    else:
+        pbp = get_play_by_play(game_id, game_date, disable_cache)
+
+    shifts_json = get_shifts(game_id, game_date, disable_cache)
+    boxscore = get_boxscore(game_id, game_date, disable_cache)
 
     home_team_id = pbp["homeTeam"]["id"]
     away_team_id = pbp["awayTeam"]["id"]
@@ -229,7 +240,7 @@ def add_on_ice_players_to_play_by_play(game_id: int, cache: bool | CachedSession
     all_player_ids = {s["playerId"] for shifts in period_shifts.values() for s in shifts}
     players: Dict[int, Player] = {}
     for pid in all_player_ids:
-        info = get_player_info(pid, cache)
+        info = get_player_info(pid, game_date, disable_cache)
         first = info.get("firstName", {}).get("default", "")
         last = info.get("lastName", {}).get("default", "")
         players[pid] = Player(
@@ -286,20 +297,30 @@ def add_on_ice_players_to_play_by_play(game_id: int, cache: bool | CachedSession
 
     return pbp
 
-def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache: bool | CachedSession = False) -> [dict]:
-    schedule = get_league_schedule(season, gameTypes, cache)
+def _game_date_from_entry(game: dict) -> date | None:
+    raw = game.get('gameDate')
+    return date.fromisoformat(raw) if raw else None
 
+def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
+    schedule = get_league_schedule(season, gameTypes, disable_cache)
     with Pool() as p:
-        return p.starmap(get_boxscore, [(game['id'], cache) for game in schedule])
+        return p.starmap(get_boxscore, [
+            (game['id'], _game_date_from_entry(game), disable_cache)
+            for game in schedule
+        ])
 
-def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache: bool | CachedSession = False) -> [dict]:
-    schedule = get_league_schedule(season, gameTypes, cache)
-
+def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
+    schedule = get_league_schedule(season, gameTypes, disable_cache)
     with Pool() as p:
-        return p.starmap(get_play_by_play, [(game['id'], cache) for game in schedule])
+        return p.starmap(get_play_by_play, [
+            (game['id'], _game_date_from_entry(game), disable_cache)
+            for game in schedule
+        ])
 
-def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, cache: bool | CachedSession = False) -> [dict]:
-    schedule = get_league_schedule(season, gameTypes, cache)
-
+def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
+    schedule = get_league_schedule(season, gameTypes, disable_cache)
     with Pool() as p:
-        return p.starmap(get_shifts, [(game['id'], cache) for game in schedule])
+        return p.starmap(get_shifts, [
+            (game['id'], _game_date_from_entry(game), disable_cache)
+            for game in schedule
+        ])
