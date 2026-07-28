@@ -13,6 +13,7 @@ or, if pytest is available:
 """
 
 import unittest
+from datetime import date
 from unittest.mock import patch, MagicMock
 
 from src.edginghockeyscraper import edginghockeyscraper
@@ -380,6 +381,70 @@ class TestAttachOnIcePlayers(unittest.TestCase):
         # sanity check: 3 data calls (shifts + play-by-play + boxscore) plus
         # one player-info call per unique player in the shifts (6 in fixture)
         self.assertEqual(self._mock_session.get.call_count, 9)
+
+
+# ---------------------------------------------------------------------------
+# Season-level integration test
+# ---------------------------------------------------------------------------
+
+class _SyncPool:
+    """Drop-in Pool replacement that runs starmap synchronously (no subprocesses)."""
+    def __enter__(self): return self
+    def __exit__(self, *_): pass
+    def starmap(self, fn, args):
+        return [fn(*a) for a in args]
+
+
+class TestGetOnIcePlayersWithPlayByPlaySeason(unittest.TestCase):
+
+    _FAKE_SCHEDULE = [
+        {'id': 101, 'gameDate': '2022-10-15'},
+        {'id': 102, 'gameDate': '2022-11-20'},
+        {'id': 103},                            # missing gameDate -> None
+    ]
+    _FAKE_RESULT = {'plays': []}
+
+    def _run(self, disable_cache=False):
+        with patch(
+            'src.edginghockeyscraper.edginghockeyscraper.get_league_schedule',
+            return_value=self._FAKE_SCHEDULE,
+        ), patch(
+            'src.edginghockeyscraper.edginghockeyscraper.Pool',
+            _SyncPool,
+        ), patch(
+            'src.edginghockeyscraper.edginghockeyscraper.get_on_ice_players_with_play_by_play',
+            return_value=self._FAKE_RESULT,
+        ) as mock_fn:
+            results = edginghockeyscraper.get_on_ice_players_with_play_by_play_season(
+                2023, disable_cache=disable_cache
+            )
+        return results, mock_fn
+
+    def test_returns_one_result_per_scheduled_game(self):
+        results, _ = self._run()
+        self.assertEqual(len(results), 3)
+
+    def test_each_result_is_the_enriched_pbp(self):
+        results, _ = self._run()
+        for r in results:
+            self.assertIs(r, self._FAKE_RESULT)
+
+    def test_game_ids_forwarded(self):
+        _, mock_fn = self._run()
+        game_ids = [c.args[0] for c in mock_fn.call_args_list]
+        self.assertEqual(game_ids, [101, 102, 103])
+
+    def test_game_dates_parsed_and_forwarded(self):
+        _, mock_fn = self._run()
+        game_dates = [c.args[1] for c in mock_fn.call_args_list]
+        self.assertEqual(game_dates[0], date(2022, 10, 15))
+        self.assertEqual(game_dates[1], date(2022, 11, 20))
+        self.assertIsNone(game_dates[2])          # missing gameDate -> None
+
+    def test_disable_cache_forwarded(self):
+        _, mock_fn = self._run(disable_cache=True)
+        for c in mock_fn.call_args_list:
+            self.assertTrue(c.args[2])
 
 
 if __name__ == "__main__":

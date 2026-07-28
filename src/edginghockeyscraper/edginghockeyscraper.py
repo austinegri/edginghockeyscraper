@@ -324,3 +324,11 @@ def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPE
             (game['id'], _game_date_from_entry(game), disable_cache)
             for game in schedule
         ])
+
+def get_on_ice_players_with_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
+    schedule = get_league_schedule(season, gameTypes, disable_cache)
+    with Pool() as p:
+        return p.starmap(get_on_ice_players_with_play_by_play, [
+            (game['id'], _game_date_from_entry(game), disable_cache)
+            for game in schedule
+        ])
