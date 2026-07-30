@@ -34,6 +34,13 @@ def _stint_iter_to_model_rows(iterable) -> list:
         away_for     = {k: v for p in stint['away_skaters'] for k, v in [(f'{p.name}_{p.playerId}_for', 1), (f'{p.name}_{p.playerId}_against', 0)]}
         away_against = {k: v for p in stint['away_skaters'] for k, v in [(f'{p.name}_{p.playerId}_for', 0), (f'{p.name}_{p.playerId}_against', 1)]}
 
+        hg = stint.get('home_goalie')
+        ag = stint.get('away_goalie')
+        home_goalie_for     = {f'{hg.name}_{hg.playerId}_goalie_for': 1, f'{hg.name}_{hg.playerId}_goalie_against': 0} if hg else {}
+        home_goalie_against = {f'{hg.name}_{hg.playerId}_goalie_for': 0, f'{hg.name}_{hg.playerId}_goalie_against': 1} if hg else {}
+        away_goalie_for     = {f'{ag.name}_{ag.playerId}_goalie_for': 1, f'{ag.name}_{ag.playerId}_goalie_against': 0} if ag else {}
+        away_goalie_against = {f'{ag.name}_{ag.playerId}_goalie_for': 0, f'{ag.name}_{ag.playerId}_goalie_against': 1} if ag else {}
+
         home_sit         = f"{len(stint['home_skaters'])}v{len(stint['away_skaters'])}"
         away_sit         = f"{len(stint['away_skaters'])}v{len(stint['home_skaters'])}"
 
@@ -42,8 +49,8 @@ def _stint_iter_to_model_rows(iterable) -> list:
         home_score_state = max(-3, min(3, stint['home_score'] - stint['away_score']))
         away_score_state = max(-3, min(3, stint['away_score'] - stint['home_score']))
 
-        rows.append({**base, 'team': 'home', 'game_type': stint['game_type'], 'score_state': home_score_state, 'zone_start': stint['start_zone_home'], 'situation': home_sit, **event_counts(stint['home_events']), **home_for, **away_against})
-        rows.append({**base, 'team': 'away', 'game_type': stint['game_type'], 'score_state': away_score_state, 'zone_start': stint['start_zone_away'], 'situation': away_sit, **event_counts(stint['away_events']), **away_for, **home_against})
+        rows.append({**base, 'team': 'home', 'game_type': stint['game_type'], 'score_state': home_score_state, 'zone_start': stint['start_zone_home'], 'situation': home_sit, **event_counts(stint['home_events']), **home_for, **away_against, **home_goalie_for, **away_goalie_against})
+        rows.append({**base, 'team': 'away', 'game_type': stint['game_type'], 'score_state': away_score_state, 'zone_start': stint['start_zone_away'], 'situation': away_sit, **event_counts(stint['away_events']), **away_for, **home_against, **away_goalie_for, **home_goalie_against})
 
     return rows
 

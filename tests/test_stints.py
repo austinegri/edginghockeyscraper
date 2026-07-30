@@ -333,6 +333,23 @@ class TestStintsToModelInput(unittest.TestCase):
         self.assertIn('goal', self.df.columns)
         self.assertEqual(self.df.iloc[0]['goal'], 1)
 
+    def test_home_goalie_for_equals_1_on_home_row(self):
+        col = f'Home Goalie_{HOME_GOALIE}_goalie_for'
+        self.assertEqual(self.df.iloc[0][col], 1)
+
+    def test_home_goalie_against_equals_1_on_away_row(self):
+        # Row 1 is stint 1 / away perspective — home goalie is against
+        col = f'Home Goalie_{HOME_GOALIE}_goalie_against'
+        self.assertEqual(self.df.iloc[1][col], 1)
+
+    def test_away_goalie_against_equals_1_on_home_row(self):
+        col = f'Away Goalie_{AWAY_GOALIE}_goalie_against'
+        self.assertEqual(self.df.iloc[0][col], 1)
+
+    def test_away_goalie_for_equals_1_on_away_row(self):
+        col = f'Away Goalie_{AWAY_GOALIE}_goalie_for'
+        self.assertEqual(self.df.iloc[1][col], 1)
+
     def test_categorical_columns_are_numeric(self):
         for col in ('team', 'zone_start', 'situation', 'game_type'):
             self.assertTrue(pd.api.types.is_numeric_dtype(self.df[col]),
