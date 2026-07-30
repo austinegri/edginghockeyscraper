@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Any
+
+import pandas as pd
 
 from .data.schedule_data import GameType, REG_POST_GAME_TYPES
 from .dataclass.player import Player
@@ -12,6 +14,9 @@ from .util.util import get_session
 from tqdm.contrib.concurrent import process_map
 
 _CHUNK_SIZE = 1
+
+_GOAL_EVENTS = {'goal'}
+
 
 def _mmss_to_seconds(t: str) -> int:
     """'MM:SS' -> total seconds elapsed in the period."""
@@ -300,6 +305,210 @@ def get_on_ice_players_with_play_by_play(
         }
 
     return pbp
+
+def _build_stints_raw(shifts_json: dict, pbp: dict) -> list[dict]:
+    home_id = pbp['homeTeam']['id']
+    away_id = pbp['awayTeam']['id']
+
+    # --- build player lookup from roster spots in PBP ---------------------
+    players: Dict[int, Player] = {}
+    for spot in pbp.get('rosterSpots', []):
+        pid = spot.get('playerId')
+        if pid is None:
+            continue
+        first = spot.get('firstName', {}).get('default', '')
+        last  = spot.get('lastName', {}).get('default', '')
+        players[pid] = Player(
+            playerId=pid,
+            name=f"{first} {last}".strip(),
+            position=spot.get('positionCode', ''),
+        )
+
+    # --- parse shifts by period -------------------------------------------
+    shifts_by_period: dict = defaultdict(list)
+    for row in shifts_json.get('data', []):
+        pid    = row.get('playerId')
+        period = row.get('period')
+        start  = row.get('startTime')
+        end    = row.get('endTime')
+        tid    = row.get('teamId')
+        if None in (pid, period, tid) or not start or not end:
+            continue
+        start_s, end_s = _mmss_to_seconds(start), _mmss_to_seconds(end)
+        if end_s <= start_s:
+            continue
+        shifts_by_period[period].append(
+            {'playerId': pid, 'teamId': tid, 'start': start_s, 'end': end_s}
+        )
+
+    # --- parse events, tracking PBP order ---------------------------------
+    # first_faceoff_pbp_idx[(period, time_s)] = index of the first faceoff
+    # at that time in the PBP — used to split events at a breakpoint time
+    events_by_period: dict = defaultdict(list)
+    first_faceoff_pbp_idx: dict = {}
+    for pbp_idx, play in enumerate(pbp.get('plays', [])):
+        period = play.get('periodDescriptor', {}).get('number')
+        t      = play.get('timeInPeriod')
+        etype  = play.get('typeDescKey')
+        if period is None or not t or not etype:
+            continue
+        t_s = _mmss_to_seconds(t)
+        if etype == 'faceoff':
+            key = (period, t_s)
+            if key not in first_faceoff_pbp_idx:
+                first_faceoff_pbp_idx[key] = pbp_idx
+        events_by_period[period].append({
+            'time':       t_s,
+            'type':       etype,
+            'event_team': play.get('details', {}).get('eventOwnerTeamId'),
+            'pbp_idx':    pbp_idx,
+            'play':       play,
+        })
+
+    # --- build stints -----------------------------------------------------
+    rows = []
+    home_score = 0
+    away_score = 0
+    for period in sorted(shifts_by_period):
+        shifts = shifts_by_period[period]
+        events = events_by_period.get(period, [])
+
+        breakpoints = sorted({t for s in shifts for t in (s['start'], s['end'])})
+
+        for t_start, t_end in zip(breakpoints, breakpoints[1:]):
+            home_skaters: list = []
+            away_skaters: list = []
+            home_goalie: Optional[Player] = None
+            away_goalie: Optional[Player] = None
+            for s in shifts:
+                if not (s['start'] <= t_start and s['end'] >= t_end):
+                    continue
+                p = players.get(s['playerId'], Player(playerId=s['playerId'], name='', position=''))
+                if s['teamId'] == home_id:
+                    if p.position == 'G':
+                        home_goalie = p
+                    else:
+                        home_skaters.append(p)
+                elif s['teamId'] == away_id:
+                    if p.position == 'G':
+                        away_goalie = p
+                    else:
+                        away_skaters.append(p)
+            home_skaters.sort()
+            away_skaters.sort()
+
+            # Index of the first faceoff at t_end (if any)
+            faceoff_idx = first_faceoff_pbp_idx.get((period, t_end))
+
+            stint_events: list = []
+            home_events: list = []
+            away_events: list = []
+            start_zone_home = 'OTF'
+            start_zone_away = 'OTF'
+            for e in events:
+                t = e['time']
+                if t_start <= t < t_end:
+                    in_stint = True
+                elif t == t_end and faceoff_idx is not None:
+                    in_stint = e['pbp_idx'] < faceoff_idx
+                else:
+                    in_stint = False
+
+                if in_stint:
+                    play = e['play']
+                    stint_events.append(play)
+                    if e['event_team'] == home_id:
+                        home_events.append(play)
+                    elif e['event_team'] == away_id:
+                        away_events.append(play)
+
+                # Faceoff at t_start defines the zone the stint started in.
+                # zoneCode is from the winning team's perspective, so derive
+                # each team's zone independently.
+                if t == t_start and e['type'] == 'faceoff':
+                    details = e['play'].get('details', {})
+                    zone    = details.get('zoneCode')
+                    winner  = details.get('eventOwnerTeamId')
+                    _flip   = {'O': 'D', 'D': 'O', 'N': 'N'}
+                    if zone in ('O', 'D', 'N'):
+                        start_zone_home = zone if winner == home_id else _flip[zone]
+                        start_zone_away = zone if winner == away_id else _flip[zone]
+
+            rows.append({
+                'period':           period,
+                'time_start':       t_start,
+                'time_end':         t_end,
+                'duration':         t_end - t_start,
+                'start_zone_home':  start_zone_home,
+                'start_zone_away':  start_zone_away,
+                'home_score':       home_score,
+                'away_score':       away_score,
+                'home_skaters':     home_skaters,
+                'home_goalie':      home_goalie,
+                'away_skaters':     away_skaters,
+                'away_goalie':      away_goalie,
+                'events':           stint_events,
+                'home_events':      home_events,
+                'away_events':      away_events,
+            })
+
+            # Update running score after appending (goals end the stint,
+            # so the next stint starts with the updated score)
+            # ToDo:  if a goal is scored during a stint, this will not reflect until next stint.
+            # Should stint end if goal is scored?
+            for play in home_events:
+                if play.get('typeDescKey') == 'goal':
+                    home_score += 1
+            for play in away_events:
+                if play.get('typeDescKey') == 'goal':
+                    away_score += 1
+
+    return rows
+
+
+def build_stints(shifts_json: dict, pbp: dict) -> pd.DataFrame:
+    return pd.DataFrame(_build_stints_raw(shifts_json, pbp))
+
+
+def _game_type_from_id(game_id: int) -> GameType | None:
+    code = (game_id // 10000) % 100
+    return GameType(code) if GameType.has_value(code) else None
+
+
+def _build_stints_for_game(game_id: int, game_date: date | None, disable_cache: bool) -> list[dict]:
+    pbp    = get_play_by_play(game_id, game_date, disable_cache)
+    shifts = get_shifts(game_id, game_date, disable_cache)
+    stints = _build_stints_raw(shifts, pbp)
+    game_type = _game_type_from_id(game_id)
+    for s in stints:
+        s['game_id']   = game_id
+        s['game_date'] = game_date
+        s['game_type'] = game_type
+    return stints
+
+
+def build_stints_season(
+    season: int,
+    gameTypes: set[GameType] = REG_POST_GAME_TYPES,
+    disable_cache: bool = False,
+) -> list[dict]:
+    """
+    Fetch shifts + PBP for every game in the season in parallel and return
+    all stints as a flat list of raw dicts.  Convert to a DataFrame once
+    at the call site to avoid the overhead of constructing ~1300 DataFrames:
+
+        stints = build_stints_season(2024)
+        df = pd.DataFrame(stints)
+    """
+    schedule = get_league_schedule(season, gameTypes, disable_cache)
+    ids, dates, flags = _season_args(schedule, disable_cache)
+    per_game: list[list[dict]] = process_map(
+        _build_stints_for_game, ids, dates, flags,
+        chunksize=_CHUNK_SIZE,
+        desc=f"Stints {season}",
+    )
+    return [stint for game in per_game for stint in game]
+
 
 def _game_date_from_entry(game: dict) -> date | None:
     raw = game.get('gameDate')
