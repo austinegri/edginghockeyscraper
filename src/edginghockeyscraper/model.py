@@ -12,11 +12,10 @@ _CORSI_EVENTS   = {'shot-on-goal', 'blocked-shot', 'missed-shot', 'goal'}
 _FENWICK_EVENTS = {'shot-on-goal', 'missed-shot', 'goal'}
 
 
-def _stint_iter_to_model_rows(iterable) -> tuple[list, set[str]]:
+def _stint_iter_to_model_rows(iterable) -> list:
     """Shared logic for stints_to_model_input and stints_to_model_input_season.
     Accepts any iterable of dict-like objects (raw dicts or DataFrame iterrows)."""
     rows: list = []
-    player_cols: set[str] = set()
 
     def event_counts(events: list) -> dict:
         counts = Counter(e.get('typeDescKey') for e in events)
@@ -29,13 +28,6 @@ def _stint_iter_to_model_rows(iterable) -> tuple[list, set[str]]:
             'game_id':   stint.get('game_id'),
             'game_date': stint.get('game_date'),
         }
-
-        for p in stint['home_skaters']:
-            player_cols.add(f'{p.name}_{p.playerId}_for')
-            player_cols.add(f'{p.name}_{p.playerId}_against')
-        for p in stint['away_skaters']:
-            player_cols.add(f'{p.name}_{p.playerId}_for')
-            player_cols.add(f'{p.name}_{p.playerId}_against')
 
         home_for     = {k: v for p in stint['home_skaters'] for k, v in [(f'{p.name}_{p.playerId}_for', 1), (f'{p.name}_{p.playerId}_against', 0)]}
         home_against = {k: v for p in stint['home_skaters'] for k, v in [(f'{p.name}_{p.playerId}_for', 0), (f'{p.name}_{p.playerId}_against', 1)]}
@@ -53,23 +45,23 @@ def _stint_iter_to_model_rows(iterable) -> tuple[list, set[str]]:
         rows.append({**base, 'team': 'home', 'game_type': stint['game_type'], 'score_state': home_score_state, 'zone_start': stint['start_zone_home'], 'situation': home_sit, **event_counts(stint['home_events']), **home_for, **away_against})
         rows.append({**base, 'team': 'away', 'game_type': stint['game_type'], 'score_state': away_score_state, 'zone_start': stint['start_zone_away'], 'situation': away_sit, **event_counts(stint['away_events']), **away_for, **home_against})
 
-    return rows, player_cols
+    return rows
 
 
-def _finalise_model_df(rows: list, player_cols: set[str]) -> tuple[pd.DataFrame, set[str]]:
+def _finalise_model_df(rows: list) -> pd.DataFrame:
     df = pd.DataFrame(rows).fillna(0)
     df['team']       = pd.Categorical(df['team']).codes
     df['zone_start'] = pd.Categorical(df['zone_start']).codes
     df['situation']  = pd.Categorical(df['situation']).codes
     df['game_type']  = pd.Categorical(df['game_type']).codes
-    return df, player_cols
+    return df
 
 
-def stints_to_model_input(stints: pd.DataFrame) -> tuple[pd.DataFrame, set[str]]:
-    rows, player_cols = _stint_iter_to_model_rows(
+def stints_to_model_input(stints: pd.DataFrame) -> pd.DataFrame:
+    rows = _stint_iter_to_model_rows(
         stint for _, stint in stints.iterrows()
     )
-    return _finalise_model_df(rows, player_cols)
+    return _finalise_model_df(rows)
 
 
 def stints_to_model_input_season(
@@ -82,5 +74,5 @@ def stints_to_model_input_season(
     convert directly to model input — one DataFrame construction at the end.
     """
     raw_stints = build_stints_season(season, gameTypes, disable_cache)
-    rows, player_cols = _stint_iter_to_model_rows(iter(raw_stints))
-    return _finalise_model_df(rows, player_cols)
+    rows = _stint_iter_to_model_rows(iter(raw_stints))
+    return _finalise_model_df(rows)

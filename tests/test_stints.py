@@ -12,7 +12,6 @@ import pandas as pd
 from src.edginghockeyscraper import edginghockeyscraper
 import src.edginghockeyscraper.model as ehs_model
 from src.edginghockeyscraper.data.schedule_data import GameType
-from src.edginghockeyscraper.dataclass.player import Player
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -313,16 +312,11 @@ class TestStintsToModelInput(unittest.TestCase):
         stints_df['game_id']   = 999
         stints_df['game_date'] = date(2024, 1, 1)
         stints_df['game_type'] = GameType.REG
-        self.df, self.player_cols = ehs_model.stints_to_model_input(stints_df)
+        self.df = ehs_model.stints_to_model_input(stints_df)
 
     def test_two_rows_per_stint(self):
         # 2 stints × 2 rows (home + away) = 4
         self.assertEqual(len(self.df), 4)
-
-    def test_player_cols_populated(self):
-        self.assertTrue(len(self.player_cols) > 0)
-        for col in self.player_cols:
-            self.assertIn(col, self.df.columns)
 
     def test_home_skater_for_equals_1_on_home_row(self):
         # Row 0 is stint 1 / home perspective — HOME_SKATER_1 is on ice here
