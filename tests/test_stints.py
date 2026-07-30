@@ -314,6 +314,12 @@ class TestStintsToModelInput(unittest.TestCase):
         stints_df['game_type'] = GameType.REG
         self.df = ehs_model.stints_to_model_input(stints_df)
 
+    def test_no_game_type_column_does_not_raise(self):
+        # build_stints() does not stamp game_type; stints_to_model_input must tolerate its absence
+        stints_df = edginghockeyscraper.build_stints(make_shifts_json(), make_pbp_json())
+        df = ehs_model.stints_to_model_input(stints_df)
+        self.assertEqual(len(df), 4)
+
     def test_two_rows_per_stint(self):
         # 2 stints × 2 rows (home + away) = 4
         self.assertEqual(len(self.df), 4)

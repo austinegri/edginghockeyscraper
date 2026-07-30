@@ -49,8 +49,9 @@ def _stint_iter_to_model_rows(iterable) -> list:
         home_score_state = max(-3, min(3, stint['home_score'] - stint['away_score']))
         away_score_state = max(-3, min(3, stint['away_score'] - stint['home_score']))
 
-        rows.append({**base, 'team': 'home', 'game_type': stint['game_type'], 'score_state': home_score_state, 'zone_start': stint['start_zone_home'], 'situation': home_sit, **event_counts(stint['home_events']), **home_for, **away_against, **home_goalie_for, **away_goalie_against})
-        rows.append({**base, 'team': 'away', 'game_type': stint['game_type'], 'score_state': away_score_state, 'zone_start': stint['start_zone_away'], 'situation': away_sit, **event_counts(stint['away_events']), **away_for, **home_against, **away_goalie_for, **home_goalie_against})
+        game_type = stint.get('game_type')
+        rows.append({**base, 'team': 'home', 'game_type': game_type, 'score_state': home_score_state, 'zone_start': stint['start_zone_home'], 'situation': home_sit, **event_counts(stint['home_events']), **home_for, **away_against, **home_goalie_for, **away_goalie_against})
+        rows.append({**base, 'team': 'away', 'game_type': game_type, 'score_state': away_score_state, 'zone_start': stint['start_zone_away'], 'situation': away_sit, **event_counts(stint['away_events']), **away_for, **home_against, **away_goalie_for, **home_goalie_against})
 
     return rows
 
