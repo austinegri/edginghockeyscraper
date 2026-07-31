@@ -356,10 +356,10 @@ class TestStintsToModelInput(unittest.TestCase):
         col = f'Away Goalie_{AWAY_GOALIE}_goalie_for'
         self.assertEqual(self.df.iloc[1][col], 1)
 
-    def test_categorical_columns_are_numeric(self):
+    def test_categorical_columns_are_category_dtype(self):
         for col in ('team', 'zone_start', 'situation', 'game_type'):
-            self.assertTrue(pd.api.types.is_numeric_dtype(self.df[col]),
-                            f"Column '{col}' is not numeric after encoding")
+            self.assertEqual(self.df[col].dtype.name, 'category',
+                             f"Column '{col}' is not category dtype after encoding")
 
 
 if __name__ == '__main__':
