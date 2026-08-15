@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date
-from typing import Tuple, Dict, List, Optional, Any
+from typing import Tuple, Dict, List, Optional, Any, Iterable, Literal
 
 import pandas as pd
 
@@ -11,11 +11,45 @@ from .data.schedule_data import GameType, REG_POST_GAME_TYPES
 from .dataclass.player import Player
 from .util.util import get_session
 
-from tqdm.contrib.concurrent import process_map
+from tqdm.contrib.concurrent import process_map, thread_map
 
 _CHUNK_SIZE = 1
 
 _GOAL_EVENTS = {'goal'}
+
+# 'process' matches historical behavior (CPU-isolated workers, good when a lot
+# of per-game post-processing happens alongside the fetch, e.g. build_stints).
+# 'thread' is usually faster for the pure single-endpoint fetchers below
+# (get_play_by_play/get_shifts/get_boxscore): each call is one blocking HTTP
+# GET + a .json() parse, so the work is I/O-bound and releases the GIL while
+# waiting on the network. Threads also skip the cost of pickling large PBP/
+# shift payloads back across a process boundary, which process_map pays per
+# game. Benchmark on your own connection/CPU before assuming thread is faster
+# -- it depends on how much the NHL API rate-limits concurrent connections,
+# and requests_cache's sqlite backend serializes writes from many threads in
+# one process, which can become the bottleneck at high thread counts.
+FetchBackend = Literal['process', 'thread']
+
+
+def _map(
+    fn,
+    *iterables,
+    backend: FetchBackend = 'process',
+    max_workers: int | None = None,
+    chunksize: int = _CHUNK_SIZE,
+    desc: str = '',
+):
+    """Shared dispatch for process_map/thread_map with an optional worker override.
+
+    max_workers=None keeps each backend's own default (process_map ->
+    os.cpu_count(); thread_map -> min(32, os.cpu_count() + 4)) so existing
+    callers that don't pass it see unchanged behavior.
+    """
+    mapper = thread_map if backend == 'thread' else process_map
+    kwargs: dict = dict(chunksize=chunksize, desc=desc)
+    if max_workers is not None:
+        kwargs['max_workers'] = max_workers
+    return mapper(fn, *iterables, **kwargs)
 
 
 def _mmss_to_seconds(t: str) -> int:
@@ -491,6 +525,8 @@ def build_stints_season(
     season: int,
     gameTypes: set[GameType] = REG_POST_GAME_TYPES,
     disable_cache: bool = False,
+    max_workers: int | None = None,
+    fetch_backend: FetchBackend = 'process',
 ) -> list[dict]:
     """
     Fetch shifts + PBP for every game in the season in parallel and return
@@ -502,9 +538,9 @@ def build_stints_season(
     """
     schedule = get_league_schedule(season, gameTypes, disable_cache)
     ids, dates, flags = _season_args(schedule, disable_cache)
-    per_game: list[list[dict]] = process_map(
+    per_game: list[list[dict]] = _map(
         _build_stints_for_game, ids, dates, flags,
-        chunksize=_CHUNK_SIZE,
+        backend=fetch_backend, max_workers=max_workers,
         desc=f"Stints {season}",
     )
     return [stint for game in per_game for stint in game]
@@ -521,22 +557,99 @@ def _season_args(schedule: list[dict], disable_cache: bool) -> tuple[list, list,
     return ids, dates, flags
 
 
-def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
-    schedule = get_league_schedule(season, gameTypes, disable_cache)
-    ids, dates, flags = _season_args(schedule, disable_cache)
-    return process_map(get_boxscore, ids, dates, flags, chunksize=_CHUNK_SIZE, desc=f"Boxscores {season}")
+def _multi_season_args(
+    seasons: Iterable[int],
+    gameTypes: set[GameType] = REG_POST_GAME_TYPES,
+    disable_cache: bool = False,
+) -> tuple[list, list, list]:
+    """Fetch the schedule for every season in `seasons` and flatten the
+    results into one combined (ids, dates, flags) triple.
 
-def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
-    schedule = get_league_schedule(season, gameTypes, disable_cache)
-    ids, dates, flags = _season_args(schedule, disable_cache)
-    return process_map(get_play_by_play, ids, dates, flags, chunksize=_CHUNK_SIZE, desc=f"Play-by-play {season}")
+    Schedule pulls stay sequential (they're cheap, paginated weekly-page
+    calls, and each season's schedule is small relative to per-game fetches),
+    but the combined game list lets the caller issue ONE pooled fetch across
+    the whole multi-season range instead of spinning up/tearing down a
+    worker pool once per season -- that per-season pool churn is the main
+    structural inefficiency in a loop like:
 
-def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
-    schedule = get_league_schedule(season, gameTypes, disable_cache)
-    ids, dates, flags = _season_args(schedule, disable_cache)
-    return process_map(get_shifts, ids, dates, flags, chunksize=_CHUNK_SIZE, desc=f"Shifts {season}")
+        for season in range(2010, 2026):
+            get_play_by_play_season(season)   # new pool every iteration
 
-def get_on_ice_players_with_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
+    which get_play_by_play_seasons() (and friends, below) replace.
+    """
+    ids: list = []
+    dates: list = []
+    flags: list = []
+    for season in seasons:
+        schedule = get_league_schedule(season, gameTypes, disable_cache)
+        s_ids, s_dates, s_flags = _season_args(schedule, disable_cache)
+        ids.extend(s_ids)
+        dates.extend(s_dates)
+        flags.extend(s_flags)
+    return ids, dates, flags
+
+
+def _seasons_map(
+    fn,
+    seasons: Iterable[int],
+    gameTypes: set[GameType],
+    disable_cache: bool,
+    max_workers: int | None,
+    fetch_backend: FetchBackend,
+    desc_prefix: str,
+):
+    seasons = list(seasons)
+    if not seasons:
+        return []
+    ids, dates, flags = _multi_season_args(seasons, gameTypes, disable_cache)
+    span = f"{seasons[0]}" if len(seasons) == 1 else f"{min(seasons)}-{max(seasons)}"
+    return _map(
+        fn, ids, dates, flags,
+        backend=fetch_backend, max_workers=max_workers,
+        desc=f"{desc_prefix} {span} ({len(ids)} games)",
+    )
+
+
+def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
     schedule = get_league_schedule(season, gameTypes, disable_cache)
     ids, dates, flags = _season_args(schedule, disable_cache)
-    return process_map(get_on_ice_players_with_play_by_play, ids, dates, flags, chunksize=_CHUNK_SIZE, desc=f"On-ice PBP {season}")
+    return _map(get_boxscore, ids, dates, flags, backend=fetch_backend, max_workers=max_workers, desc=f"Boxscores {season}")
+
+def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+    schedule = get_league_schedule(season, gameTypes, disable_cache)
+    ids, dates, flags = _season_args(schedule, disable_cache)
+    return _map(get_play_by_play, ids, dates, flags, backend=fetch_backend, max_workers=max_workers, desc=f"Play-by-play {season}")
+
+def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+    schedule = get_league_schedule(season, gameTypes, disable_cache)
+    ids, dates, flags = _season_args(schedule, disable_cache)
+    return _map(get_shifts, ids, dates, flags, backend=fetch_backend, max_workers=max_workers, desc=f"Shifts {season}")
+
+def get_on_ice_players_with_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+    schedule = get_league_schedule(season, gameTypes, disable_cache)
+    ids, dates, flags = _season_args(schedule, disable_cache)
+    return _map(get_on_ice_players_with_play_by_play, ids, dates, flags, backend=fetch_backend, max_workers=max_workers, desc=f"On-ice PBP {season}")
+
+
+# --- Multi-season variants -------------------------------------------------
+# Same endpoints, but pulling several seasons through a single pooled fetch.
+# Prefer these over looping the *_season() functions when backfilling a
+# range of seasons (e.g. building an xG training set from 2010-2026): one
+# pool for the whole range instead of one per season, and max_workers/
+# fetch_backend apply uniformly across all of it.
+
+def get_boxscore_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+    return _seasons_map(get_boxscore, seasons, gameTypes, disable_cache, max_workers, fetch_backend, 'Boxscores')
+
+def get_play_by_play_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+    return _seasons_map(get_play_by_play, seasons, gameTypes, disable_cache, max_workers, fetch_backend, 'Play-by-play')
+
+def get_shifts_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+    return _seasons_map(get_shifts, seasons, gameTypes, disable_cache, max_workers, fetch_backend, 'Shifts')
+
+def get_on_ice_players_with_play_by_play_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+    return _seasons_map(get_on_ice_players_with_play_by_play, seasons, gameTypes, disable_cache, max_workers, fetch_backend, 'On-ice PBP')
+
+def build_stints_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+    per_game: list[list[dict]] = _seasons_map(_build_stints_for_game, seasons, gameTypes, disable_cache, max_workers, fetch_backend, 'Stints')
+    return [stint for game in per_game for stint in game]
