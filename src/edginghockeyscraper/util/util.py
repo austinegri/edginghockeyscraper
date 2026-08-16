@@ -11,10 +11,20 @@ from requests_cache import BaseCache, CachedSession, NEVER_EXPIRE
 _CACHE_PATH = Path.home() / '.edginghockeyscraper' / 'nhl_cache'
 _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Default backend/location for get_permanent_session below; override its
-# backend/cache_name args to point at something other than local sqlite.
+# Backend/location get_session builds its CachedSession from; override via
+# set_session_backend. A fresh CachedSession is still built per call (its
+# expire_after varies by game_date), so this configures where, not a
+# reusable session instance.
+_session_backend: str | BaseCache = 'sqlite'
+_session_cache_name: str | Path = _CACHE_PATH
+_session_backend_kwargs: dict = {}
+
+# Same idea for get_permanent_session below; override via
+# set_permanent_backend to point at something other than local sqlite.
 _PERMANENT_CACHE_PATH = Path.home() / '.edginghockeyscraper' / 'permanent_cache'
-_PERMANENT_BACKEND = 'sqlite'
+_permanent_backend: str | BaseCache = 'sqlite'
+_permanent_cache_name: str | Path = _PERMANENT_CACHE_PATH
+_permanent_backend_kwargs: dict = {}
 
 _RETRY = Retry(
     total=5,
@@ -23,8 +33,6 @@ _RETRY = Retry(
     allowed_methods={"GET"},
     raise_on_status=False,
 )
-
-_BACKEND = 'sqlite'
 
 _HEADERS = {
     "User-Agent": (
@@ -44,6 +52,14 @@ def _prepare_session(session: requests.Session) -> requests.Session:
     session.mount("http://", adapter)
     session.headers.update(_HEADERS)
     return session
+
+
+def set_session_backend(backend: str | BaseCache, cache_name: str | Path, **backend_kwargs) -> None:
+    """Configure where get_session builds its CachedSession from."""
+    global _session_backend, _session_cache_name, _session_backend_kwargs
+    _session_backend = backend
+    _session_cache_name = cache_name
+    _session_backend_kwargs = backend_kwargs
 
 
 def get_session(
@@ -92,14 +108,24 @@ def get_session(
         expire_after = timedelta(days=365)
     elif expire_after is None:
         expire_after = timedelta(days=days_since_game)
-    session = CachedSession(str(_CACHE_PATH), backend=_BACKEND, expire_after=expire_after)
+    session = CachedSession(
+        _session_cache_name, backend=_session_backend, expire_after=expire_after, **_session_backend_kwargs
+    )
     _prepare_session(session)
     return session
 
 
+def set_permanent_backend(backend: str | BaseCache, cache_name: str | Path, **backend_kwargs) -> None:
+    """Configure where get_permanent_session builds its CachedSession from."""
+    global _permanent_backend, _permanent_cache_name, _permanent_backend_kwargs
+    _permanent_backend = backend
+    _permanent_cache_name = cache_name
+    _permanent_backend_kwargs = backend_kwargs
+
+
 def get_permanent_session(
-    backend: str | BaseCache = _PERMANENT_BACKEND,
-    cache_name: str | Path = _PERMANENT_CACHE_PATH,
+    backend: str | BaseCache | None = None,
+    cache_name: str | Path | None = None,
     **backend_kwargs,
 ) -> CachedSession:
     """
@@ -109,10 +135,13 @@ def get_permanent_session(
     get_session's: that one's entries expire on purpose (game-day freshness
     rules, see its docstring), and this one's shouldn't.
 
-    backend/cache_name/**backend_kwargs pass straight through to
-    requests_cache.CachedSession, so any backend it supports works here, not
-    just the local sqlite default -- e.g. backend='dynamodb' or 'redis' with
-    connection kwargs, or an already-constructed BaseCache instance.
+    With no arguments, builds from the configured defaults (local sqlite,
+    or whatever set_permanent_backend last set). Passing backend/cache_name/
+    **backend_kwargs here builds a one-off session for this call only,
+    without changing the configured defaults -- use set_permanent_backend
+    for that.
     """
+    if backend is None and cache_name is None and not backend_kwargs:
+        backend, cache_name, backend_kwargs = _permanent_backend, _permanent_cache_name, _permanent_backend_kwargs
     session = CachedSession(cache_name, backend=backend, expire_after=NEVER_EXPIRE, **backend_kwargs)
     return _prepare_session(session)

@@ -2,11 +2,15 @@
 
 """Tests for `edginghockeyscraper` package."""
 
+import shutil
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 
 from src.edginghockeyscraper import edginghockeyscraper
 from src.edginghockeyscraper.data.schedule_data import GameType
+from src.edginghockeyscraper.util import util
 
 # Game used across per-game tests: 2023-24 regular season, known past game.
 _GAME_ID = 2024020345
@@ -41,6 +45,41 @@ class TestPlayerInfo(unittest.TestCase):
     def test_get_player_position_goalie(self):
         pos = edginghockeyscraper.get_player_position(8447687, game_date=_GAME_DATE)
         self.assertEqual(pos, 'G')
+
+
+class TestPlayerHandedness(unittest.TestCase):
+    """Redirects the permanent cache at a scratch sqlite file for the
+    duration of each test, instead of the real ~/.edginghockeyscraper/
+    permanent_cache, so these tests don't read or write real cache state.
+    """
+
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp()
+        self._cache_path = Path(self._tmp_dir) / 'test_permanent_cache'
+        util.set_permanent_backend('sqlite', str(self._cache_path))
+
+    def tearDown(self):
+        util.set_permanent_backend('sqlite', str(util._PERMANENT_CACHE_PATH))
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    def test_returns_l_or_r(self):
+        handedness = edginghockeyscraper.get_player_handedness(8479420)
+        self.assertIn(handedness, ('L', 'R'))
+
+    def test_second_call_is_served_from_cache(self):
+        edginghockeyscraper.get_player_handedness(8479420)
+        session = util.get_permanent_session()
+        response = session.get('https://api-web.nhle.com/v1/player/8479420/landing')
+        self.assertTrue(response.from_cache)
+
+    def test_disable_cache_bypasses_permanent_cache(self):
+        edginghockeyscraper.get_player_handedness(8479420)
+        session = util.get_permanent_session()
+        cached_response = session.get('https://api-web.nhle.com/v1/player/8479420/landing')
+        self.assertTrue(cached_response.from_cache)
+
+        handedness = edginghockeyscraper.get_player_handedness(8479420, disable_cache=True)
+        self.assertIn(handedness, ('L', 'R'))
 
 
 class TestLeagueSchedule(unittest.TestCase):
