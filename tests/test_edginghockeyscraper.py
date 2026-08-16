@@ -96,6 +96,26 @@ class TestLeagueSchedule(unittest.TestCase):
         games = edginghockeyscraper.get_league_schedule(2024, {GameType.REG}, disable_cache=True)
         self.assertEqual(len(games), 1312)
 
+    def test_every_game_has_a_gamedate(self):
+        """Regression guard: schedule game objects have no 'gameDate' key of
+        their own (only 'startTimeUTC'), so get_league_schedule copies it in
+        from the enclosing day's 'date'. Without this, callers reading
+        game['gameDate'] silently get None for every game."""
+        games = edginghockeyscraper.get_league_schedule(2024, {GameType.REG})
+        missing = [g['id'] for g in games if not g.get('gameDate')]
+        self.assertEqual(missing, [])
+
+    def test_gamedate_matches_known_game(self):
+        # 2023020001: 2023-24 season opener, Predators @ Lightning,
+        # 2023-10-10 -- verified directly against the schedule API.
+        # Deliberately not asserting gameDate == startTimeUTC[:10] here --
+        # that's what this fix avoids relying on, since a late-night start
+        # can fall on a different UTC calendar day than the scheduled game
+        # date. Check against the known date for this game instead.
+        games = edginghockeyscraper.get_league_schedule(2024, {GameType.REG})
+        game = next(g for g in games if g['id'] == 2023020001)
+        self.assertEqual(game['gameDate'], '2023-10-10')
+
 
 class TestPerGameEndpoints(unittest.TestCase):
 

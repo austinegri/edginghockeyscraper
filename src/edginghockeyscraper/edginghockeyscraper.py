@@ -224,6 +224,15 @@ def get_player_handedness(playerId: int, disable_cache: bool = False) -> Optiona
     return get_player_info(playerId, disable_cache=disable_cache, session=session).get('shootsCatches')
 
 def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
+    """
+    Returns the raw schedule game objects for `season`, filtered to
+    `gameTypes`, each with a 'gameDate' key added (e.g. '2023-10-10') --
+    the schedule endpoint's game objects don't carry a date of their own
+    (only 'startTimeUTC', a full timestamp), so this copies it over from
+    the enclosing day's 'date' rather than leaving callers to rederive it
+    from startTimeUTC themselves and risk a UTC-day rollover for
+    late-night games.
+    """
     gameTypes = set([gameType.value for gameType in gameTypes]) # hack to check valid gameTypes bc was getting issue testing with gameTypes={GameType.REG}
     SCHEDULE_URL = 'https://api-web.nhle.com/v1/schedule/{}'
     nextStartDate = '{}-07-01'.format(season - 1)
@@ -243,6 +252,7 @@ def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TY
         for gameDay in schedule['gameWeek']:
             for game in gameDay['games']:
                 if game['gameType'] in gameTypes:
+                    game['gameDate'] = gameDay.get('date')
                     games.append(game)
 
     return games
