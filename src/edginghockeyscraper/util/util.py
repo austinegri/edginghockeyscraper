@@ -6,10 +6,15 @@ from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from requests_cache import CachedSession
+from requests_cache import BaseCache, CachedSession, NEVER_EXPIRE
 
 _CACHE_PATH = Path.home() / '.edginghockeyscraper' / 'nhl_cache'
 _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Default backend/location for get_permanent_session below; override its
+# backend/cache_name args to point at something other than local sqlite.
+_PERMANENT_CACHE_PATH = Path.home() / '.edginghockeyscraper' / 'permanent_cache'
+_PERMANENT_BACKEND = 'sqlite'
 
 _RETRY = Retry(
     total=5,
@@ -90,3 +95,24 @@ def get_session(
     session = CachedSession(str(_CACHE_PATH), backend=_BACKEND, expire_after=expire_after)
     _prepare_session(session)
     return session
+
+
+def get_permanent_session(
+    backend: str | BaseCache = _PERMANENT_BACKEND,
+    cache_name: str | Path = _PERMANENT_CACHE_PATH,
+    **backend_kwargs,
+) -> CachedSession:
+    """
+    Return a CachedSession that never expires -- for endpoints where only
+    permanent fields are read from the response (fields that never change
+    once set, e.g. a player's shootsCatches). A separate cache from
+    get_session's: that one's entries expire on purpose (game-day freshness
+    rules, see its docstring), and this one's shouldn't.
+
+    backend/cache_name/**backend_kwargs pass straight through to
+    requests_cache.CachedSession, so any backend it supports works here, not
+    just the local sqlite default -- e.g. backend='dynamodb' or 'redis' with
+    connection kwargs, or an already-constructed BaseCache instance.
+    """
+    session = CachedSession(cache_name, backend=backend, expire_after=NEVER_EXPIRE, **backend_kwargs)
+    return _prepare_session(session)

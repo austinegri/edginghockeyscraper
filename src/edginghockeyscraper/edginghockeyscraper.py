@@ -6,10 +6,11 @@ from datetime import date
 from typing import Tuple, Dict, List, Optional, Any, Iterable, Literal
 
 import pandas as pd
+from requests_cache import CachedSession
 
 from .data.schedule_data import GameType, REG_POST_GAME_TYPES
 from .dataclass.player import Player
-from .util.util import get_session
+from .util.util import get_permanent_session, get_session
 
 from tqdm.contrib.concurrent import process_map, thread_map
 
@@ -152,7 +153,12 @@ def get_league_year_by_date(given_date: date) -> int:
 def get_current_NHL_year() -> int:
     return get_league_year_by_date(date.today())
 
-def get_player_info(playerId: int, game_date: date | None = None, disable_cache: bool = False) -> dict:
+def get_player_info(
+    playerId: int,
+    game_date: date | None = None,
+    disable_cache: bool = False,
+    session: CachedSession | None = None,
+) -> dict:
     """
     Returns:
     - response (dict): A dictionary containing the scraped player data.
@@ -196,11 +202,26 @@ def get_player_info(playerId: int, game_date: date | None = None, disable_cache:
     """
 
     url = 'https://api-web.nhle.com/v1/player/{}/landing'
-    session = get_session(game_date, disable_cache)
+    session = session or get_session(game_date, disable_cache)
     return session.get(url.format(playerId)).json()
 
 def get_player_position(playerId: int, game_date: date | None = None, disable_cache: bool = False) -> str:
     return get_player_info(playerId, game_date, disable_cache)['position']
+
+def get_player_handedness(playerId: int, disable_cache: bool = False) -> Optional[str]:
+    """
+    Returns the player's shootsCatches ('L'/'R'), fetched through the
+    permanent cache (see util.get_permanent_session) instead of
+    get_session's game-date-keyed one -- handedness never changes once set,
+    unlike most of what /v1/player/{id}/landing returns, so this is safe to
+    cache forever. Only shootsCatches is read off the response; nothing else
+    from that payload is exposed here.
+
+    disable_cache=True skips the permanent cache and does a live fetch,
+    matching disable_cache's meaning elsewhere in this module.
+    """
+    session = None if disable_cache else get_permanent_session()
+    return get_player_info(playerId, disable_cache=disable_cache, session=session).get('shootsCatches')
 
 def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False) -> list[dict]:
     gameTypes = set([gameType.value for gameType in gameTypes]) # hack to check valid gameTypes bc was getting issue testing with gameTypes={GameType.REG}
