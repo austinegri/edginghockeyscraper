@@ -440,7 +440,9 @@ def _build_stints_raw(shifts_json: dict, pbp: dict) -> list[dict]:
 
         breakpoints = sorted({t for s in shifts for t in (s['start'], s['end'])})
 
-        for t_start, t_end in zip(breakpoints, breakpoints[1:]):
+        last_pair_idx = len(breakpoints) - 2
+        for pair_idx, (t_start, t_end) in enumerate(zip(breakpoints, breakpoints[1:])):
+            is_last_stint = pair_idx == last_pair_idx
             home_skaters: list = []
             away_skaters: list = []
             home_goalie: Optional[Player] = None
@@ -464,6 +466,8 @@ def _build_stints_raw(shifts_json: dict, pbp: dict) -> list[dict]:
 
             # Index of the first faceoff at t_end (if any)
             faceoff_idx = first_faceoff_pbp_idx.get((period, t_end))
+            # Index of the first faceoff at t_start (if any)
+            start_faceoff_idx = first_faceoff_pbp_idx.get((period, t_start))
 
             stint_events: list = []
             home_events: list = []
@@ -472,10 +476,19 @@ def _build_stints_raw(shifts_json: dict, pbp: dict) -> list[dict]:
             start_zone_away = 'OTF'
             for e in events:
                 t = e['time']
-                if t_start <= t < t_end:
+                if t == t_start and start_faceoff_idx is not None:
+                    # At a breakpoint the faceoff splits the events there:
+                    # those before it belong to the preceding stint.
+                    in_stint = e['pbp_idx'] >= start_faceoff_idx
+                elif t_start <= t < t_end:
                     in_stint = True
                 elif t == t_end and faceoff_idx is not None:
                     in_stint = e['pbp_idx'] < faceoff_idx
+                elif is_last_stint and t >= t_end:
+                    # The final stint of a period is closed at the top: with no
+                    # stint after it, events at or past t_end have nowhere else
+                    # to go. Period-ending and overtime-winning goals land here.
+                    in_stint = True
                 else:
                     in_stint = False
 
