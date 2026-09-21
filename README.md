@@ -23,6 +23,7 @@ https://pypi.python.org/pypi/edginghockeyscraper
 
 * Get League schedule for year
         - Usage`schedule = edginghockeyscraper.get_league_schedule(2024)`
+        - Each game object is stamped with `gameDate` from its enclosing schedule day
 * Get Game boxscore
     * `boxscore = edginghockeyscraper.get_boxscore(2024020345)`
 * Get Game playByPlay
@@ -52,6 +53,14 @@ https://pypi.python.org/pypi/edginghockeyscraper
 * `'process'` matches historical behavior (CPU-isolated workers), and suits cases with heavier per-game post-processing (e.g. `build_stints_season`/`build_stints_seasons`).
 * `'thread'` is often faster for the pure single-endpoint fetchers (`get_boxscore`, `get_play_by_play`, `get_shifts`, `get_on_ice_players_with_play_by_play`) since each call is a blocking HTTP GET + JSON parse -- I/O-bound work that releases the GIL while waiting on the network, and threads skip the cost of pickling large payloads back across a process boundary. Benchmark on your own connection/CPU before assuming thread is faster -- it depends on how much the NHL API rate-limits concurrent connections, and requests-cache's sqlite backend serializes writes from many threads in one process, which can become the bottleneck at high thread counts.
 * `max_workers=None` (the default) keeps each backend's own default (`process_map` -> `os.cpu_count()`; `thread_map` -> `min(32, os.cpu_count() + 4)`).
+
+### Get player handedness (permanently cached)
+* `handedness = edginghockeyscraper.get_player_handedness(8478402)` returns `'L'`/`'R'`, fetched from `/v1/player/{id}/landing`.
+* Backed by a separate permanent cache from the game-date-keyed one used elsewhere -- handedness never changes once set, so entries never expire. Pass `disable_cache=True` to force a live fetch.
+
+### Point either cache at a custom backend
+* `set_session_backend(backend, cache_name, **backend_kwargs)` and `set_permanent_backend(backend, cache_name, **backend_kwargs)` let you swap the game-date-keyed cache and the permanent cache off the default local sqlite file onto any [requests-cache](https://pypi.org/project/requests-cache/) backend (e.g. DynamoDB, Redis).
+* `get_permanent_session()` builds from the configured default when called with no arguments, or accepts `backend`/`cache_name`/`**backend_kwargs` directly for a one-off session without changing the configured default.
 
 ### Utilize [requests-cache](https://pypi.org/project/requests-cache/) for fast repeated request calls
 * Caching is on by default; pass `disable_cache=True` to bypass it.
