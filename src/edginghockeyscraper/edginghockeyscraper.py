@@ -145,6 +145,11 @@ def _sweep_period(
     return result
 
 
+#: (month, day) after the season's end year where the schedule walk stops.
+#: The latest-finishing season on record is 2019-20, whose playoffs ended
+#: 2020-09-28.
+SEASON_WINDOW_END = (10, 31)
+
 def get_league_year_by_date(given_date: date) -> int:
     if given_date >= date(year= given_date.year, month= 7, day= 1):
         return given_date.year + 1
@@ -232,28 +237,44 @@ def get_league_schedule(season: int, gameTypes: set[GameType] = REG_POST_GAME_TY
     the enclosing day's 'date' rather than leaving callers to rederive it
     from startTimeUTC themselves and risk a UTC-day rollover for
     late-night games.
+
+    Games are kept by the season each one names ('season': 20192020), not
+    by date. The endpoint pages a week at a time, so the walk runs from
+    July 1 before the season to SEASON_WINDOW_END after it: wide enough
+    for the 2020 bubble playoffs (August-September 2020), which a July 1
+    cutoff put in 2020-21. Windows of adjacent seasons overlap; the season
+    filter keeps each game in one.
     """
     gameTypes = set([gameType.value for gameType in gameTypes]) # hack to check valid gameTypes bc was getting issue testing with gameTypes={GameType.REG}
     SCHEDULE_URL = 'https://api-web.nhle.com/v1/schedule/{}'
-    nextStartDate = '{}-07-01'.format(season - 1)
-    nextYear, nextMonth, nextDay = nextStartDate.split('-')
-    endDate = date(season, 7, 1)
+    season_id = int(f'{season - 1}{season}')
+    start = date(season - 1, 7, 1)
+    end = date(season, *SEASON_WINDOW_END)
 
-    # Use the season-end date as a proxy so completed seasons are cached.
-    season_end = date(season, 7, 1)
-    session = get_session(game_date=season_end, disable_cache=disable_cache)
-    schedule = session.get(SCHEDULE_URL.format(nextStartDate)).json()
+    # A finished season's schedule is cached, with the window end as its
+    # date. An unfinished season's is not: its later weeks change (playoff
+    # games are added as series are set), and caching them to a future date
+    # would serve the empty weeks until then.
+    if end < date.today():
+        session = get_session(game_date=end, disable_cache=disable_cache)
+    else:
+        session = get_session(game_date=None, disable_cache=disable_cache)
+    schedule = session.get(SCHEDULE_URL.format(start.isoformat())).json()
 
     games = []
-    while 'nextStartDate' in schedule and date(int(nextYear), int(nextMonth), int(nextDay)) < endDate:
-        nextStartDate = schedule['nextStartDate']
-        nextYear, nextMonth, nextDay = nextStartDate.split('-')
-        schedule = session.get(SCHEDULE_URL.format(nextStartDate)).json()
-        for gameDay in schedule['gameWeek']:
+    seen = set()
+    while True:
+        for gameDay in schedule.get('gameWeek', []):
             for game in gameDay['games']:
-                if game['gameType'] in gameTypes:
+                if (game['gameType'] in gameTypes and game.get('season') == season_id
+                        and game['id'] not in seen):
+                    seen.add(game['id'])
                     game['gameDate'] = gameDay.get('date')
                     games.append(game)
+        nextStartDate = schedule.get('nextStartDate')
+        if not nextStartDate or date.fromisoformat(nextStartDate) > end:
+            break
+        schedule = session.get(SCHEDULE_URL.format(nextStartDate)).json()
 
     return games
 

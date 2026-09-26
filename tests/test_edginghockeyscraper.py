@@ -5,6 +5,7 @@
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from datetime import date
 from pathlib import Path
 
@@ -96,6 +97,18 @@ class TestLeagueSchedule(unittest.TestCase):
         games = edginghockeyscraper.get_league_schedule(2024, {GameType.REG}, disable_cache=True)
         self.assertEqual(len(games), 1312)
 
+    def test_2020_includes_the_bubble_playoffs(self):
+        """2019-20's playoffs ran August 1 - September 28, 2020, after the old
+        July 1 cutoff. 1,082 regular-season and 130 playoff games."""
+        games = edginghockeyscraper.get_league_schedule(2020)
+        self.assertEqual(len(games), 1212)
+        self.assertEqual({g['season'] for g in games}, {20192020})
+
+    def test_2021_excludes_the_bubble_playoffs(self):
+        games = edginghockeyscraper.get_league_schedule(2021)
+        self.assertEqual({g['season'] for g in games}, {20202021})
+        self.assertEqual(max(g['gameDate'] for g in games), '2021-07-07')
+
     def test_every_game_has_a_gamedate(self):
         """Regression guard: schedule game objects have no 'gameDate' key of
         their own (only 'startTimeUTC'), so get_league_schedule copies it in
@@ -115,6 +128,78 @@ class TestLeagueSchedule(unittest.TestCase):
         games = edginghockeyscraper.get_league_schedule(2024, {GameType.REG})
         game = next(g for g in games if g['id'] == 2023020001)
         self.assertEqual(game['gameDate'], '2023-10-10')
+
+
+class TestLeagueScheduleWindow(unittest.TestCase):
+    """Offline: get_league_schedule against canned weekly pages."""
+
+    @staticmethod
+    def page(start, next_start, games):
+        return {'nextStartDate': next_start,
+                'gameWeek': [{'date': d, 'games': [{'id': i, 'season': s, 'gameType': gt}
+                                                   for i, s, gt in day]}
+                             for d, day in games]}
+
+    def run_schedule(self, season, pages, gameTypes=None):
+        class Session:
+            def __init__(self):
+                self.urls = []
+
+            def get(self, url):
+                self.urls.append(url)
+                body = pages[url.rsplit('/', 1)[1]]
+                return mock.Mock(json=lambda: body)
+
+        session = Session()
+        with mock.patch.object(edginghockeyscraper, 'get_session', return_value=session):
+            args = (season,) if gameTypes is None else (season, gameTypes)
+            games = edginghockeyscraper.get_league_schedule(*args)
+        return games, session.urls
+
+    def test_keeps_games_by_their_season_not_their_date(self):
+        pages = {
+            '2020-07-01': self.page('2020-07-01', '2020-08-01', []),
+            '2020-08-01': self.page('2020-08-01', '2021-01-13', [
+                ('2020-08-01', [(2019030001, 20192020, 3)])]),
+            '2021-01-13': self.page('2021-01-13', None, [
+                ('2021-01-13', [(2020020001, 20202021, 2)])]),
+        }
+        games, _ = self.run_schedule(2021, pages)
+        self.assertEqual([g['id'] for g in games], [2020020001])
+
+    def test_late_playoffs_are_in_their_own_season(self):
+        pages = {
+            '2019-07-01': self.page('2019-07-01', '2019-10-02', []),
+            '2019-10-02': self.page('2019-10-02', '2020-08-01', [
+                ('2019-10-02', [(2019020001, 20192020, 2)])]),
+            '2020-08-01': self.page('2020-08-01', '2020-09-28', [
+                ('2020-08-01', [(2019030001, 20192020, 3)])]),
+            '2020-09-28': self.page('2020-09-28', '2020-12-31', [
+                ('2020-09-28', [(2019030416, 20192020, 3)])]),
+        }
+        games, urls = self.run_schedule(2020, pages)
+        self.assertEqual([g['id'] for g in games], [2019020001, 2019030001, 2019030416])
+        self.assertEqual(games[-1]['gameDate'], '2020-09-28')
+        # 2020-12-31 is past the window, so it is never requested.
+        self.assertNotIn('2020-12-31', ' '.join(urls))
+
+    def test_unfinished_season_is_not_cached(self):
+        pages = {'2026-07-01': self.page('2026-07-01', None, [])}
+        with mock.patch.object(edginghockeyscraper, 'date', wraps=date) as fake_date:
+            fake_date.today.return_value = date(2026, 9, 26)
+            fake_date.side_effect = lambda *a, **k: date(*a, **k)
+            with mock.patch.object(edginghockeyscraper, 'get_session') as get_session:
+                get_session.return_value.get.return_value.json.return_value = pages['2026-07-01']
+                edginghockeyscraper.get_league_schedule(2027)
+                self.assertIsNone(get_session.call_args.kwargs['game_date'])
+                edginghockeyscraper.get_league_schedule(2025)
+                self.assertEqual(get_session.call_args.kwargs['game_date'], date(2025, 10, 31))
+
+    def test_first_week_is_read(self):
+        pages = {'2021-07-01': self.page('2021-07-01', None, [
+            ('2021-07-05', [(2021010001, 20212022, 1), (2021020001, 20212022, 2)])])}
+        games, _ = self.run_schedule(2022, pages, {GameType.REG})
+        self.assertEqual([g['id'] for g in games], [2021020001])
 
 
 class TestPerGameEndpoints(unittest.TestCase):
