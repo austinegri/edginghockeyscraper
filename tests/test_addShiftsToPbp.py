@@ -195,6 +195,21 @@ class TestBuildPeriodShifts(unittest.TestCase):
         self.assertEqual(goalie_shift["start"], 0)
         self.assertEqual(goalie_shift["end"], 120)
 
+    def test_bad_end_time_recovered_from_duration(self):
+        # 2019030016: goalies' full periods are written 00:00 -> 00:00, duration 20:00
+        shifts = {"data": [{"playerId": HOME_GOALIE, "period": 1, "startTime": "00:00",
+                            "endTime": "00:00", "duration": "20:00", "teamId": HOME_TEAM_ID}]}
+        per_period = edginghockeyscraper._build_period_shifts(shifts)
+        self.assertEqual([(s["start"], s["end"]) for s in per_period[1]], [(0, 1200)])
+
+    def test_rows_for_other_teams_dropped_when_teams_given(self):
+        shifts = make_shifts_json()
+        shifts["data"].append({"playerId": HOME_SKATER_1, "period": 1, "startTime": "00:00",
+                               "endTime": "01:00", "teamId": 99})
+        kept = edginghockeyscraper._build_period_shifts(shifts, {HOME_TEAM_ID, AWAY_TEAM_ID})
+        self.assertEqual({s["teamId"] for s in kept[1]}, {HOME_TEAM_ID, AWAY_TEAM_ID})
+        self.assertIn(99, {s["teamId"] for s in edginghockeyscraper._build_period_shifts(shifts)[1]})
+
 
 class TestLoadGoalieIds(unittest.TestCase):
 
@@ -378,9 +393,9 @@ class TestAttachOnIcePlayers(unittest.TestCase):
         self.assertEqual(onice["awayGoalie"].playerId, AWAY_GOALIE)
 
     def test_no_live_network_calls_made(self):
-        # sanity check: 3 data calls (shifts + play-by-play + boxscore) plus
-        # one player-info call per unique player in the shifts (6 in fixture)
-        self.assertEqual(self._mock_session.get.call_count, 9)
+        # 3 data calls (shifts + play-by-play + boxscore); players are named
+        # from the payloads, not fetched one by one
+        self.assertEqual(self._mock_session.get.call_count, 3)
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from requests_cache import CachedSession
 from .data.schedule_data import GameType, REG_POST_GAME_TYPES
 from .dataclass.player import Player
 from .util.util import get_permanent_session, get_session
+from .toi_report import get_toi_report, shifts_from_toi_reports
 
 from tqdm.contrib.concurrent import process_map, thread_map
 
@@ -67,14 +68,21 @@ def _load_goalie_ids(boxscore: dict) -> Tuple[set, set]:
     return home_g, away_g
 
 
-def _build_period_shifts(shifts_json: dict) -> Dict[int, List[dict]]:
+def _build_period_shifts(shifts_json: dict, team_ids: set | None = None) -> Dict[int, List[dict]]:
     """
     Group valid shifts by period, normalized to seconds-elapsed-in-period.
 
-    Skips rows with missing player/time/team data, and rows with
-    end <= start (the shift feed contains a handful of zero/negative
-    duration bookkeeping rows, e.g. period-end / game-end markers, that
-    aren't real shifts).
+    Skips rows with missing player/time/team data, rows for a team outside
+    `team_ids` when it's given (some responses repeat the game's shifts
+    under unrelated teams, e.g. 2021020513), and rows with end <= start
+    (the shift feed contains a handful of zero/negative duration
+    bookkeeping rows, e.g. period-end / game-end markers, that aren't real
+    shifts).
+
+    A row whose end is at or before its start but whose duration is
+    positive is a real shift with a bad end time (e.g. a goalie's full
+    period written 00:00 -> 00:00, duration 20:00); it ends at start +
+    duration instead.
     """
     per_period: Dict[int, List[dict]] = defaultdict(list)
     for row in shifts_json.get("data", []):
@@ -85,9 +93,13 @@ def _build_period_shifts(shifts_json: dict) -> Dict[int, List[dict]]:
         team_id = row.get("teamId")
         if pid is None or period is None or not start or not end or team_id is None:
             continue
+        if team_ids is not None and team_id not in team_ids:
+            continue
 
         start_s = _mmss_to_seconds(start)
         end_s = _mmss_to_seconds(end)
+        if end_s <= start_s and row.get("duration"):
+            end_s = start_s + _mmss_to_seconds(row["duration"])
         if end_s <= start_s:
             continue
 
@@ -299,8 +311,10 @@ def get_on_ice_players_with_play_by_play(
     disable_cache: bool = False,
 ) -> dict:
     """
-    Fetch shift, play-by-play, and boxscore data for `game_id`, and return
-    the play-by-play payload with an added 'onIce' block on every play:
+    Fetch shift, play-by-play, and boxscore data for `game_id` (plus the HTML
+    time-on-ice reports when the game has no API shifts), and return the
+    play-by-play payload with an added 'onIce' block on every play, built by
+    `build_on_ice`:
 
         play["onIce"] = {
             "homeSkaters": [Player, ...],   # no goalie, no duplicates
@@ -325,28 +339,49 @@ def get_on_ice_players_with_play_by_play(
     shifts_json = get_shifts(game_id, game_date, disable_cache)
     boxscore = get_boxscore(game_id, game_date, disable_cache)
 
+    # The shift-chart API has nothing for some games (all of 2009-10, a block
+    # of late 2024-25); the HTML time-on-ice reports still do.
+    toi_reports = None
+    if not _build_period_shifts(shifts_json, {pbp["homeTeam"]["id"], pbp["awayTeam"]["id"]}):
+        home_html = get_toi_report(game_id, home=True)
+        away_html = get_toi_report(game_id, home=False)
+        if home_html is not None and away_html is not None:
+            toi_reports = (home_html, away_html)
+
+    return build_on_ice(pbp, shifts_json, boxscore, toi_reports)
+
+def build_on_ice(
+    pbp: dict,
+    shifts_json: dict,
+    boxscore: dict,
+    toi_reports: Tuple[bytes, bytes] | None = None,
+) -> dict:
+    """
+    Returns a copy of the play-by-play `pbp` with an 'onIce' block on every
+    play, in the shape `get_on_ice_players_with_play_by_play` documents.
+
+    Pure: makes no network calls and leaves its inputs unmodified, so on-ice
+    attribution can be re-derived from landed raw payloads. Players are named
+    from the play-by-play's rosterSpots, falling back to the boxscore.
+
+    toi_reports: the game's (home, away) HTML time-on-ice reports, used only
+    when `shifts_json` has no usable shifts (see _build_period_shifts and
+    toi_report.shifts_from_toi_reports).
+    Without them, such a game gets empty on-ice lists.
+    """
     home_team_id = pbp["homeTeam"]["id"]
     away_team_id = pbp["awayTeam"]["id"]
     home_goalies, away_goalies = _load_goalie_ids(boxscore)
 
-    period_shifts = _build_period_shifts(shifts_json)
-
-    # Resolve every unique player ID that appears in the shifts to a Player object.
-    all_player_ids = {s["playerId"] for shifts in period_shifts.values() for s in shifts}
-    players: Dict[int, Player] = {}
-    for pid in all_player_ids:
-        info = get_player_info(pid, game_date, disable_cache)
-        first = info.get("firstName", {}).get("default", "")
-        last = info.get("lastName", {}).get("default", "")
-        players[pid] = Player(
-            playerId=pid,
-            name=f"{first} {last}".strip(),
-            position=info.get("position", ""),
-        )
+    team_ids = {home_team_id, away_team_id}
+    period_shifts = _build_period_shifts(shifts_json, team_ids)
+    if not period_shifts and toi_reports is not None:
+        period_shifts = _build_period_shifts(shifts_from_toi_reports(*toi_reports, boxscore), team_ids)
+    players = _roster_players(pbp, boxscore)
 
     # Bucket play-by-play events by period, keeping their original index
-    # so results can be written back in-place afterward.
-    plays = pbp.get("plays", [])
+    # so results can be written back afterward.
+    plays = [dict(play) for play in pbp.get("plays", [])]
     events_by_period: Dict[int, List[Tuple[int, int, bool]]] = defaultdict(list)
     for i, play in enumerate(plays):
         period = play.get("periodDescriptor", {}).get("number")
@@ -390,14 +425,24 @@ def get_on_ice_players_with_play_by_play(
             "awayGoalie": away_goalie,
         }
 
-    return pbp
+    return {**pbp, "plays": plays}
 
-def _build_stints_raw(shifts_json: dict, pbp: dict) -> list[dict]:
-    home_id = pbp['homeTeam']['id']
-    away_id = pbp['awayTeam']['id']
-
-    # --- build player lookup from roster spots in PBP ---------------------
+def _roster_players(pbp: dict, boxscore: dict | None = None) -> Dict[int, Player]:
+    """
+    playerId -> Player for everyone dressed in the game, from the
+    play-by-play's rosterSpots. Players missing there fall back to the
+    boxscore's (abbreviated) name and position, when a boxscore is given.
+    """
     players: Dict[int, Player] = {}
+    stats = (boxscore or {}).get('playerByGameStats', {})
+    for side in ('homeTeam', 'awayTeam'):
+        for group in ('forwards', 'defense', 'goalies'):
+            for p in stats.get(side, {}).get(group, []):
+                players[p['playerId']] = Player(
+                    playerId=p['playerId'],
+                    name=p.get('name', {}).get('default', ''),
+                    position=p.get('position', ''),
+                )
     for spot in pbp.get('rosterSpots', []):
         pid = spot.get('playerId')
         if pid is None:
@@ -409,6 +454,14 @@ def _build_stints_raw(shifts_json: dict, pbp: dict) -> list[dict]:
             name=f"{first} {last}".strip(),
             position=spot.get('positionCode', ''),
         )
+    return players
+
+def _build_stints_raw(shifts_json: dict, pbp: dict) -> list[dict]:
+    home_id = pbp['homeTeam']['id']
+    away_id = pbp['awayTeam']['id']
+
+    # --- build player lookup from roster spots in PBP ---------------------
+    players = _roster_players(pbp)
 
     # --- parse shifts by period -------------------------------------------
     shifts_by_period: dict = defaultdict(list)
