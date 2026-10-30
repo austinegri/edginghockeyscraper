@@ -305,6 +305,41 @@ def get_shifts(gameId: int, game_date: date | None = None, disable_cache: bool =
     session = get_session(game_date, disable_cache)
     return session.get(SHIFTS_URL).json()
 
+def get_goal_tracking(gameId: int, eventId: int, game_date: date | None = None, disable_cache: bool = False) -> list[dict]:
+    """
+    Returns the NHL EDGE puck/player tracking frames (10 per second) for the
+    replay of a goal. Each frame is {'timeStamp', 'onIce': {id: {playerId, x,
+    y, sweaterNumber, teamId, teamAbbrev}}}; the puck is id '1' with an empty
+    playerId. x/y are inches from the rink corner (0-2400 x 0-1020) -- see
+    build_goal_tracking for NHL feet coordinates. Returns [] when the replay
+    isn't published (only goals get one, and it can lag the PBP event).
+    """
+    start_year = gameId // 1000000
+    GOAL_TRACKING_URL = 'https://wsr.nhle.com/sprites/{}{}/{}/ev{}.json'.format(start_year, start_year + 1, gameId, eventId)
+    session = get_session(game_date, disable_cache)
+    response = session.get(GOAL_TRACKING_URL)
+    return response.json() if response.ok else []
+
+def build_goal_tracking(frames: list[dict]) -> pd.DataFrame:
+    """One row per (frame, object) from get_goal_tracking, with x/y in NHL feet (center ice = 0,0)."""
+    rows = []
+    for i, frame in enumerate(frames):
+        for key, obj in frame['onIce'].items():
+            if 'x' not in obj:
+                continue  # object (usually the puck) not tracked this frame -- comes through as {}
+            rows.append({
+                'frame':         i,
+                'timeStamp':     frame['timeStamp'],
+                'is_puck':       key == '1',
+                'playerId':      obj.get('playerId') or None,
+                'sweaterNumber': obj.get('sweaterNumber') or None,
+                'teamId':        obj.get('teamId') or None,
+                'teamAbbrev':    obj.get('teamAbbrev') or None,
+                'x':             obj['x'] / 12 - 100,
+                'y':             42.5 - obj['y'] / 12,
+            })
+    return pd.DataFrame(rows)
+
 def get_on_ice_players_with_play_by_play(
     game_id: int,
     game_date: date | None = None,

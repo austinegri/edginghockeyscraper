@@ -28,6 +28,9 @@ https://pypi.python.org/pypi/edginghockeyscraper
     * `boxscore = edginghockeyscraper.get_boxscore(2024020345)`
 * Get Game playByPlay
     * `playByPlay = edginghockeyscraper.get_play_by_play(2024020345)`
+* Get goal puck/player tracking (NHL EDGE replay, 10 frames per second)
+    * `frames = edginghockeyscraper.get_goal_tracking(2026020211, 95)` (game id, goal's PBP eventId); `[]` until the replay is published
+    * `df = edginghockeyscraper.build_goal_tracking(frames)` -- one row per frame and object, x/y in NHL feet
 * Get Season boxscores
     * `boxscoreSeason = edginghockeyscraper.get_boxscore_season(2024)`
 * Get Season playByPlay
