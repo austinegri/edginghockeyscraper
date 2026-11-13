@@ -95,14 +95,26 @@ class TestFetchBackendDispatch(unittest.TestCase):
         pm.assert_not_called()
 
     def test_max_workers_omitted_when_none_preserves_default(self):
-        """max_workers=None must NOT be forwarded as max_workers=None --
-        that would override each backend's own smart default (e.g. thread_map's
-        min(32, cpu_count()+4)) with an explicit None, which some executors
-        treat differently than simply not passing the kwarg."""
+        """For the process backend, max_workers=None must NOT be forwarded as
+        max_workers=None -- process_map's own default (cpu_count) applies, and
+        some executors treat an explicit None differently than an omitted kwarg.
+        (The thread backend fills in _THREAD_WORKERS instead; tested below.)"""
         with patch.object(ehs, "process_map") as pm:
             ehs._map(lambda x: x, [1, 2, 3], desc="t")
         _, kwargs = pm.call_args
         self.assertNotIn("max_workers", kwargs)
+
+    def test_thread_backend_defaults_to_32_workers_regardless_of_cores(self):
+        for cores in (1, 2, 8, 64):
+            with patch("os.cpu_count", return_value=cores), \
+                 patch.object(ehs, "thread_map") as tm:
+                ehs._map(lambda x: x, [1, 2, 3], backend="thread", desc="t")
+            self.assertEqual(tm.call_args.kwargs.get("max_workers"), 32, f"{cores} cores")
+
+    def test_thread_backend_explicit_max_workers_wins(self):
+        with patch.object(ehs, "thread_map") as tm:
+            ehs._map(lambda x: x, [1, 2, 3], backend="thread", max_workers=4, desc="t")
+        self.assertEqual(tm.call_args.kwargs.get("max_workers"), 4)
 
     def test_max_workers_passed_through_when_set(self):
         with patch.object(ehs, "process_map") as pm:

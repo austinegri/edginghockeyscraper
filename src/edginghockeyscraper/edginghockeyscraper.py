@@ -19,18 +19,29 @@ _CHUNK_SIZE = 1
 
 _GOAL_EVENTS = {'goal'}
 
-# 'process' matches historical behavior (CPU-isolated workers, good when a lot
-# of per-game post-processing happens alongside the fetch, e.g. build_stints).
-# 'thread' is usually faster for the pure single-endpoint fetchers below
-# (get_play_by_play/get_shifts/get_boxscore): each call is one blocking HTTP
-# GET + a .json() parse, so the work is I/O-bound and releases the GIL while
-# waiting on the network. Threads also skip the cost of pickling large PBP/
-# shift payloads back across a process boundary, which process_map pays per
-# game. Benchmark on your own connection/CPU before assuming thread is faster
-# -- it depends on how much the NHL API rate-limits concurrent connections,
-# and requests_cache's sqlite backend serializes writes from many threads in
-# one process, which can become the bottleneck at high thread counts.
+# 'thread' is the default for the pure single-endpoint fetchers below
+# (get_boxscore/get_play_by_play/get_shifts *_season(s)): each call is one
+# blocking HTTP GET + a .json() parse, so the work is I/O-bound and releases
+# the GIL while waiting on the network. Threads don't need a core each, skip
+# pickling large PBP/shift payloads back across a process boundary, and see
+# set_session_backend/set_permanent_backend overrides (spawned processes
+# re-import util and get its defaults instead).
+# 'process' stays the default where real per-game CPU work runs alongside
+# the fetch (on-ice sweeps, build_stints).
+# Either way every worker writes to the same requests-cache store; for the
+# default sqlite file, util turns on WAL + a 30s busy_timeout so concurrent
+# writers wait their turn instead of failing with 'database is locked'.
 FetchBackend = Literal['process', 'thread']
+
+# Default thread count for the 'thread' backend, regardless of core count.
+# Fetch threads spend nearly all their time waiting on the NHL API, so they
+# don't need a core each; thread_map's own default, min(32, cpu_count + 4),
+# would give a 2-core machine 6 threads and an 8-core one 12. Benchmarked
+# on 500 games of PBP (3 interleaved rounds, medians): 32 threads took
+# 2.9s wall vs 4.0s at 16 and 10.4s at 8, at the same ~1.4s CPU, with the
+# tightest spread -- more requests in flight ride out the API's slow
+# responses. Pass max_workers to go lower if the API starts returning 429s.
+_THREAD_WORKERS = 32
 
 
 def _map(
@@ -43,12 +54,13 @@ def _map(
 ):
     """Shared dispatch for process_map/thread_map with an optional worker override.
 
-    max_workers=None keeps each backend's own default (process_map ->
-    os.cpu_count(); thread_map -> min(32, os.cpu_count() + 4)) so existing
-    callers that don't pass it see unchanged behavior.
+    max_workers=None means _THREAD_WORKERS for 'thread' and process_map's own
+    default (os.cpu_count()) for 'process'.
     """
     mapper = thread_map if backend == 'thread' else process_map
     kwargs: dict = dict(chunksize=chunksize, desc=desc)
+    if max_workers is None and backend == 'thread':
+        max_workers = _THREAD_WORKERS
     if max_workers is not None:
         kwargs['max_workers'] = max_workers
     return mapper(fn, *iterables, **kwargs)
@@ -763,17 +775,17 @@ def _seasons_map(
     )
 
 
-def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+def get_boxscore_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'thread') -> list[dict]:
     schedule = get_league_schedule(season, gameTypes, disable_cache)
     ids, dates, flags = _season_args(schedule, disable_cache)
     return _map(get_boxscore, ids, dates, flags, backend=fetch_backend, max_workers=max_workers, desc=f"Boxscores {season}")
 
-def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+def get_play_by_play_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'thread') -> list[dict]:
     schedule = get_league_schedule(season, gameTypes, disable_cache)
     ids, dates, flags = _season_args(schedule, disable_cache)
     return _map(get_play_by_play, ids, dates, flags, backend=fetch_backend, max_workers=max_workers, desc=f"Play-by-play {season}")
 
-def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+def get_shifts_season(season: int, gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'thread') -> list[dict]:
     schedule = get_league_schedule(season, gameTypes, disable_cache)
     ids, dates, flags = _season_args(schedule, disable_cache)
     return _map(get_shifts, ids, dates, flags, backend=fetch_backend, max_workers=max_workers, desc=f"Shifts {season}")
@@ -791,13 +803,13 @@ def get_on_ice_players_with_play_by_play_season(season: int, gameTypes: set[Game
 # pool for the whole range instead of one per season, and max_workers/
 # fetch_backend apply uniformly across all of it.
 
-def get_boxscore_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+def get_boxscore_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'thread') -> list[dict]:
     return _seasons_map(get_boxscore, seasons, gameTypes, disable_cache, max_workers, fetch_backend, 'Boxscores')
 
-def get_play_by_play_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+def get_play_by_play_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'thread') -> list[dict]:
     return _seasons_map(get_play_by_play, seasons, gameTypes, disable_cache, max_workers, fetch_backend, 'Play-by-play')
 
-def get_shifts_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
+def get_shifts_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'thread') -> list[dict]:
     return _seasons_map(get_shifts, seasons, gameTypes, disable_cache, max_workers, fetch_backend, 'Shifts')
 
 def get_on_ice_players_with_play_by_play_seasons(seasons: Iterable[int], gameTypes: set[GameType] = REG_POST_GAME_TYPES, disable_cache: bool = False, max_workers: int | None = None, fetch_backend: FetchBackend = 'process') -> list[dict]:
