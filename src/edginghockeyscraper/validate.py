@@ -31,6 +31,10 @@ on_ice, goalies, source_error.
     already show the next line, or the extra man of a too-many-men call is on the ice;
   * on-ice players on a penalty shot, where PL lists just the shooter and the goalie.
 
+Not noise, and not corrected anywhere: a team with more skaters in the shift data than
+the situationCode during open play ('... skaters above situationCode'). It can be a
+phantom shift row or real (too many men, a late change, or a wrong situationCode).
+
 Known differences in convention are reconciled before comparing, never flagged:
   * the API's eventOwnerTeamId on a blocked shot is the shooter's team (PL: blocker's
     team after BLOCKED BY) -- blocks are compared by the blocker's own team;
@@ -522,18 +526,33 @@ def _check_player_stats(game: _Game, es: dict | None, pbp_counts: dict, pl_count
 
 
 def _shift_totals(game: _Game, shifts_json: dict | None) -> dict[tuple, tuple[int, int]]:
-    """(side, number) -> (shift count, seconds) from shiftcharts-shaped rows."""
-    totals: dict[tuple, list[int]] = defaultdict(lambda: [0, 0])
+    """(side, number) -> (shift count, seconds) from shiftcharts-shaped rows.
+
+    Each player's duplicate and overlapping rows are merged first, as the scraper does
+    before using shifts (edginghockeyscraper._collapse_shifts; rows that only touch stay
+    separate shifts). Duplicates are reported once, under 'shifts' (_check_shifts),
+    rather than again as extra time on ice. Shifts the other sources don't have at all
+    still change these totals.
+    """
+    intervals: dict[tuple, list[tuple[int, int, int]]] = defaultdict(list)
     for r in (shifts_json or {}).get('data', []):
         if r.get('typeCode') != 517 or not r.get('startTime') or not r.get('endTime'):
             continue
         key = game.by_id.get(r['playerId'])
         if key is None:
             continue
-        seconds = _sec(r['duration']) if r.get('duration') else _sec(r['endTime']) - _sec(r['startTime'])
-        totals[key][0] += 1
-        totals[key][1] += seconds
-    return {k: (v[0], v[1]) for k, v in totals.items()}
+        intervals[key].append((r['period'], _sec(r['startTime']), _sec(r['endTime'])))
+    totals: dict[tuple, tuple[int, int]] = {}
+    for key, rows in intervals.items():
+        merged: list[list[int]] = []
+        for period, start, end in sorted(rows):
+            last = merged[-1] if merged else None
+            if last is not None and last[0] == period and start < last[2]:
+                last[2] = max(last[2], end)
+            else:
+                merged.append([period, start, end])
+        totals[key] = (len(merged), sum(max(end - start, 0) for _, start, end in merged))
+    return totals
 
 
 def _check_toi(game: _Game, es: dict | None, toi_summary: dict, shifts_json: dict, report_shifts: dict | None,
@@ -838,6 +857,7 @@ def _check_on_ice(game: _Game, pbp: dict, box: dict, api: dict, raw: dict, repor
             out.add('on_ice', f'{game.abbrev[side]} skaters short of situationCode',
                     {source: f'short on {shortfall[side]} plays'},
                     note=f'{source} likely missing a player (threshold {ehs.STRENGTH_SHORTFALL_THRESHOLD})')
+    _check_strength_surplus(game, on_ice, source, out)
 
     bounds: dict[tuple, list[tuple[int, int, int]]] = defaultdict(list)
     for r in (shifts_used or {}).get('data', []):
@@ -903,6 +923,97 @@ def _check_on_ice(game: _Game, pbp: dict, box: dict, api: dict, raw: dict, repor
     for key, n in sorted(missed.items()):
         out.add('on_ice', f'{game.label(key)} on ice', {'PL': f'on for {n} events', f'build_on_ice ({source})': 'never'},
                 note=f'no shifts for this player in the {source}')
+
+
+#: Plays whose situationCode isn't compared with the shifts' skater count by
+#: _check_strength_surplus: at a stoppage the shifts may already show the next line
+#: (the PL strength check covers stoppages), and on a penalty shot situationCode
+#: counts only the shooter and the goalie.
+_SURPLUS_SKIP_TYPES = {'stoppage', 'penalty', 'delayed-penalty'}
+_PENALTY_SHOT_CODES = {'0101', '1010'}
+#: A too-many-men penalty this soon after a surplus ends is named in its note.
+_TOO_MANY_MEN_WINDOW = 60
+
+
+def _abs_seconds(period: int, time_in_period: str) -> int:
+    return (period - 1) * 1200 + _sec(time_in_period)
+
+
+def _check_strength_surplus(game: _Game, on_ice: dict, source: str, out: _Collector) -> None:
+    """
+    Stretches of open play where the shift data puts more skaters on a team than the
+    plays' situationCode: a stray or phantom shift row, or real (a too-many-men
+    situation or a late change). Reported, not corrected: nothing in the scraper
+    replaces shifts for a surplus. One discrepancy per stretch of consecutive plays.
+
+    Skipped: stoppages and penalty shots (see _SURPLUS_SKIP_TYPES), and a play at the
+    second a team's penalty runs out, which still carries the power-play situationCode
+    while the shifts already have the penalized player back.
+    """
+    expiries: dict[str, set[int]] = {side: set() for side in _SIDES}
+    too_many_men: dict[str, list[int]] = {side: [] for side in _SIDES}
+    for play in on_ice.get('plays', []):
+        if play.get('typeDescKey') != 'penalty':
+            continue
+        d = play.get('details', {})
+        side = game.side_of_team.get(d.get('eventOwnerTeamId'))
+        period, t = play.get('periodDescriptor', {}).get('number'), play.get('timeInPeriod')
+        if side is None or period is None or not t:
+            continue
+        start = _abs_seconds(period, t)
+        if d.get('descKey') == 'too-many-men-on-the-ice':
+            too_many_men[side].append(start)
+        minutes = d.get('duration') or 0
+        if d.get('typeCode') in ('MIN', 'BEN', 'MAJ', 'MAT') and minutes in (2, 4, 5):
+            # A double minor's first half can end early on a goal, so both halves count.
+            expiries[side].update(start + 120 * k for k in range(1, minutes // 2 + 1))
+            expiries[side].add(start + minutes * 60)
+
+    runs: dict[str, dict | None] = {side: None for side in _SIDES}
+
+    def close(side: str) -> None:
+        run = runs[side]
+        runs[side] = None
+        if run is None:
+            return
+        note = f"{run['plays']} play{'s' if run['plays'] > 1 else ''} in open play"
+        if any(0 <= t - run['end_abs'] <= _TOO_MANY_MEN_WINDOW for t in too_many_men[side]):
+            note += '; a too-many-men penalty follows'
+        span = run['start'] if run['start'] == run['end'] else f"{run['start']}-{run['end']}"
+        out.add('on_ice', f"P{run['period']} {span} {game.abbrev[side]} skaters above situationCode",
+                {'pbp situationCode': f"{run['expected']} skaters", source: f"{run['have']} skaters"},
+                note=note)
+
+    for play in on_ice.get('plays', []):
+        code, onice = play.get('situationCode') or '', play.get('onIce')
+        period = play.get('periodDescriptor', {})
+        t = play.get('timeInPeriod')
+        if (len(code) != 4 or not code.isdigit() or onice is None or not t
+                or play.get('typeDescKey') in ehs._NO_STRENGTH_TYPES or period.get('periodType') == 'SO'):
+            continue
+        number = period.get('number')
+        if code in _PENALTY_SHOT_CODES or play.get('typeDescKey') in _SURPLUS_SKIP_TYPES:
+            continue
+        actual = ehs.on_ice_code(onice)
+        t_abs = _abs_seconds(number, t)
+        for side, digit in (('away', 1), ('home', 2)):
+            run = runs[side]
+            if run is not None and run['period'] != number:
+                close(side)
+                run = None
+            have, expected = int(actual[digit]), int(code[digit])
+            if have <= expected:
+                close(side)
+                continue
+            if t_abs in expiries[side]:
+                continue
+            if run is None:
+                runs[side] = {'period': number, 'start': t, 'end': t, 'end_abs': t_abs, 'plays': 1,
+                              'expected': expected, 'have': have}
+            else:
+                run.update(end=t, end_abs=t_abs, plays=run['plays'] + 1, have=max(run['have'], have))
+    for side in _SIDES:
+        close(side)
 
 
 def _check_goalies(game: _Game, plays: list, gs: dict | None, toi_summary: dict, out: _Collector) -> None:

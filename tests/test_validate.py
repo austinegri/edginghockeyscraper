@@ -111,7 +111,8 @@ class TestPublishedGames(unittest.TestCase):
             ('PHI #8 Cam York shifts', {'shifts API': ['P3 18:19-18:50', 'P4 1:55-2:55'], 'TH/TV': []},
              'duplicate rows in the shifts API'),
         ])
-        self.assertEqual(Counter(d['category'] for d in real), {'toi': 4, 'shifts': 2})
+        # Reported once, as shifts: TOI and shift counts come from the merged rows.
+        self.assertEqual(Counter(d['category'] for d in real), {'shifts': 2})
 
     def test_penalty_clock_disagreement(self):
         # Exact matching (the default): each source's version is unmatched in the others.
@@ -246,6 +247,30 @@ class TestPlantedErrors(unittest.TestCase):
         rows.append(dict(next(r for r in rows if r['typeCode'] == 517)))
         shifts = [d for d in _new(self._GAME, s) if d['category'] == 'shifts']
         self.assertEqual([d['note'] for d in shifts], ['duplicate rows in the shifts API'])
+
+    def test_shift_duplicated_in_the_api_is_not_also_a_toi_discrepancy(self):
+        s = _sources(self._GAME)
+        rows = s['shifts']['data']
+        rows.append(dict(next(r for r in rows if r['typeCode'] == 517)))
+        self.assertEqual([d['category'] for d in _new(self._GAME, s)], ['shifts'])
+
+    def test_stray_shift_in_the_api_is_extra_time_on_ice(self):
+        s = _sources(self._GAME)
+        rows = s['shifts']['data']
+        player = next(r for r in rows if r['typeCode'] == 517 and r['period'] == 1)['playerId']
+        mine = sorted((r['startTime'], r['endTime']) for r in rows
+                      if r['playerId'] == player and r['period'] == 1 and r['typeCode'] == 517)
+        # 20 seconds in the first gap between two of the player's period-1 shifts that fits it.
+        start = next(validate._sec(a[1]) + 5 for a, b in zip(mine, mine[1:])
+                     if validate._sec(b[0]) - validate._sec(a[1]) > 30)
+        stray = dict(next(r for r in rows if r['playerId'] == player and r['typeCode'] == 517),
+                     period=1, startTime=f'{start // 60:02d}:{start % 60:02d}',
+                     endTime=f'{(start + 20) // 60:02d}:{(start + 20) % 60:02d}', duration='00:20')
+        rows.append(stray)
+        toi = {d['subject'].rsplit(' ', 1)[-1] if d['subject'].endswith('shifts') else 'toi': d['values']
+               for d in _new(self._GAME, s) if d['category'] == 'toi'}
+        self.assertEqual(toi['toi']['shifts API'] - toi['toi']['boxscore'], 20)
+        self.assertEqual(toi['shifts']['shifts API'] - toi['shifts']['boxscore'], 1)
 
     def test_goalie_shots_against(self):
         s = _sources(self._GAME)
@@ -560,6 +585,117 @@ class TestGoalsThatWereNotShots(unittest.TestCase):
         for d in new:
             others = {v for k, v in d['values'].items() if k not in ('pbp', 'pbp goalieInNetId')}
             self.assertEqual(len(others), 1, d)
+
+
+class TestShiftTotals(unittest.TestCase):
+    """_shift_totals merges each player's duplicate and overlapping rows, like the scraper."""
+
+    def setUp(self):
+        s = _sources(2025020001)
+        self.game = validate._Game(s['boxscore'], s['pbp'])
+        self.pid, self.key = next(iter(self.game.by_id.items()))
+
+    def _totals(self, *shifts):
+        rows = [{'typeCode': 517, 'playerId': self.pid, 'period': p, 'startTime': a, 'endTime': b} for p, a, b in shifts]
+        return validate._shift_totals(self.game, {'data': rows})[self.key]
+
+    def test_duplicate_row_counts_once(self):
+        self.assertEqual(self._totals((1, '00:00', '00:40'), (1, '00:00', '00:40')), (1, 40))
+
+    def test_overlapping_rows_merge(self):
+        self.assertEqual(self._totals((1, '00:00', '00:40'), (1, '00:30', '01:00')), (1, 60))
+        self.assertEqual(self._totals((1, '00:00', '01:00'), (1, '00:10', '00:20')), (1, 60))
+
+    def test_touching_rows_stay_separate_shifts(self):
+        self.assertEqual(self._totals((1, '00:00', '00:40'), (1, '00:40', '01:00')), (2, 60))
+
+    def test_same_clock_in_another_period_is_another_shift(self):
+        self.assertEqual(self._totals((1, '00:00', '00:40'), (2, '00:00', '00:40')), (2, 80))
+
+
+class TestStrengthSurplus(unittest.TestCase):
+    """_check_strength_surplus on hand-built on-ice plays."""
+
+    def setUp(self):
+        s = _sources(2025020001)
+        self.game = validate._Game(s['boxscore'], s['pbp'])
+        self.away, self.home = self.game.team_id['away'], self.game.team_id['home']
+
+    @staticmethod
+    def _play(t, code, away=5, home=5, kind='shot-on-goal', period=1, **details):
+        return {'typeDescKey': kind, 'timeInPeriod': t, 'situationCode': code,
+                'periodDescriptor': {'number': period, 'periodType': 'REG'}, 'details': details,
+                'onIce': {'awayGoalie': object(), 'homeGoalie': object(),
+                          'awaySkaters': [object()] * away, 'homeSkaters': [object()] * home}}
+
+    def _run(self, *plays):
+        out = validate._Collector()
+        validate._check_strength_surplus(self.game, {'plays': list(plays)}, 'shifts API', out)
+        return out.items
+
+    def test_a_stretch_of_surplus_plays_is_one_discrepancy(self):
+        away = self.game.abbrev['away']
+        found = self._run(self._play('05:00', '1551'),
+                          self._play('05:10', '1551', away=6),
+                          self._play('05:20', '1551', away=7, kind='hit'),
+                          self._play('05:30', '1551'))
+        self.assertEqual(found, [{
+            'category': 'on_ice', 'subject': f'P1 05:10-05:20 {away} skaters above situationCode',
+            'values': {'pbp situationCode': '5 skaters', 'shifts API': '7 skaters'},
+            'noise': False, 'note': '2 plays in open play'}])
+
+    def test_single_play(self):
+        found = self._run(self._play('05:10', '1541', home=5))
+        self.assertEqual(found[0]['subject'], f"P1 05:10 {self.game.abbrev['home']} skaters above situationCode")
+        self.assertEqual(found[0]['note'], '1 play in open play')
+
+    def test_a_shortfall_is_not_a_surplus(self):
+        self.assertEqual(self._run(self._play('05:10', '1551', away=4)), [])
+
+    def test_stoppages_and_penalty_shots_are_skipped(self):
+        self.assertEqual(self._run(self._play('05:10', '1451', away=5, kind='stoppage'),
+                                   self._play('05:10', '1451', away=5, kind='penalty'),
+                                   self._play('05:10', '1451', away=5, kind='delayed-penalty'),
+                                   self._play('06:00', '1010', away=5, home=5)), [])
+
+    def test_the_second_a_penalty_runs_out_is_skipped(self):
+        penalty = self._play('10:42', '1551', kind='penalty', eventOwnerTeamId=self.home, typeCode='MIN',
+                             duration=2, descKey='high-sticking')
+        self.assertEqual(self._run(penalty, self._play('12:42', '1541', home=5)), [])
+        # ...but not a second later.
+        self.assertEqual(len(self._run(penalty, self._play('12:43', '1541', home=5))), 1)
+        # Nor when the other team is the one with the extra skater.
+        self.assertEqual(len(self._run(penalty, self._play('12:42', '1451', away=5))), 1)
+
+    def test_double_minor_halves_and_across_periods(self):
+        penalty = self._play('19:00', '1551', kind='penalty', eventOwnerTeamId=self.away, typeCode='MIN',
+                             duration=4, descKey='high-sticking')
+        self.assertEqual(self._run(penalty, self._play('01:00', '1451', away=5, period=2),
+                                   self._play('03:00', '1451', away=5, period=2)), [])
+
+    def test_too_many_men_penalty_is_named(self):
+        tmm = self._play('05:40', '1551', kind='penalty', eventOwnerTeamId=self.away, typeCode='BEN',
+                         duration=2, descKey='too-many-men-on-the-ice')
+        found = self._run(self._play('05:10', '1551', away=6), tmm)
+        self.assertEqual(found[0]['note'], '1 play in open play; a too-many-men penalty follows')
+
+    def test_runs_end_at_the_period(self):
+        found = self._run(self._play('19:50', '1551', away=6), self._play('00:10', '1551', away=6, period=2))
+        self.assertEqual([d['subject'].split(' ')[0] for d in found], ['P1', 'P2'])
+
+    def test_published_games(self):
+        # 2009020068's situationCode is wrong twice in the 3rd, both times with OTT on a
+        # power play that it doesn't show (PL agrees with the shifts): at 14:44 it reads
+        # PIT's two minors and OTT's one as 4-on-4, and at 17:34-17:39 the API's early
+        # penalty time (17:14, vs 17:41 in GS and PL) puts PIT a man up. No other surplus.
+        expected = {2009020068: ['P3 14:44 OTT skaters above situationCode',
+                                 'P3 17:34-17:39 OTT skaters above situationCode']}
+        for game_id in _GAMES:
+            with self.subTest(game_id=game_id):
+                found = [d for d in _real(_sources(game_id)) if 'above situationCode' in d['subject']]
+                self.assertEqual([d['subject'] for d in found], expected.get(game_id, []))
+                for d in found:
+                    self.assertEqual(d['values'], {'pbp situationCode': '4 skaters', 'TH/TV shifts': '5 skaters'})
 
 
 if __name__ == '__main__':
