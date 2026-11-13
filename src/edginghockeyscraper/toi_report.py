@@ -31,6 +31,7 @@ all 2009-10:
 from __future__ import annotations
 
 import re
+from datetime import date
 from html.parser import HTMLParser
 
 from .util.util import get_session
@@ -47,12 +48,15 @@ def toi_report_url(game_id: int, home: bool) -> str:
                                  game=game_id % 1_000_000)
 
 
-def get_toi_report(game_id: int, home: bool) -> bytes | None:
+def get_toi_report(game_id: int, home: bool, game_date: date | None = None,
+                   disable_cache: bool = False) -> bytes | None:
     """Fetches one report as published. None if the NHL has no report for the game.
 
-    Uncached: reports are fetched once and landed raw, not re-read.
+    Cached like the API payloads when game_date is given (see util.get_session: recent
+    games refresh, so later corrections to a report are picked up); uncached without it.
+    A 404 is never cached.
     """
-    r = get_session(None).get(toi_report_url(game_id, home), timeout=30)
+    r = get_session(game_date, disable_cache).get(toi_report_url(game_id, home))
     if r.status_code == 404:
         return None
     r.raise_for_status()
@@ -185,6 +189,58 @@ def parse_toi_report(html: bytes, game_id: int, team_id: int, roster: dict[int, 
                 'typeCode': 517,  # shiftcharts' code for a shift
             })
     return rows
+
+
+_SUMMARY_PERIOD = re.compile(r'^(\d+|OT\d*|TOT)$')
+_CLOCK = re.compile(r'^\d+:\d\d$')
+
+
+def parse_toi_summary(html: bytes) -> list[dict]:
+    """One team's report -> each player's per-period summary table.
+
+    [{'number': 6, 'name': 'BOESER, BROCK',
+      'periods': [{'period': 1, 'shifts': 7, 'avgShift': '00:57', 'toi': '06:40',
+                   'evenStrengthToi': '04:02', 'powerPlayToi': '02:38', 'shorthandedToi': '00:00'},
+                  ...],
+      'total': {... same keys, 'period': None ...}}, ...]
+
+    The summary is what the report prints under each player's shifts (Per, SHF, AVG,
+    TOI, EV TOT, PP TOT, SH TOT); 'TOT' is the game line. Overtime reads as period 4,
+    like the shift rows. Players are in report order (by sweater number).
+    """
+    parser = _Rows()
+    parser.feed(html.decode('utf-8', errors='replace'))
+
+    players: list[dict] = []
+    current: dict | None = None
+    for cells in parser.rows:
+        heading = next((text for text, cls in cells if 'playerHeading' in cls), None)
+        if heading is not None:
+            m = _HEADING.match(heading)
+            current = None
+            if m:
+                current = {'number': int(m.group(1)), 'name': f'{m.group(2)}, {m.group(3)}',
+                           'periods': [], 'total': None}
+                players.append(current)
+            continue
+        texts = [text for text, _ in cells]
+        if (current is None or len(texts) != 7 or not _SUMMARY_PERIOD.match(texts[0])
+                or not texts[1].isdigit() or not all(_CLOCK.match(t) for t in texts[2:])):
+            continue
+        line = {
+            'period': None if texts[0] == 'TOT' else _period(texts[0]),
+            'shifts': int(texts[1]),
+            'avgShift': _mmss(_seconds(texts[2])),
+            'toi': _mmss(_seconds(texts[3])),
+            'evenStrengthToi': _mmss(_seconds(texts[4])),
+            'powerPlayToi': _mmss(_seconds(texts[5])),
+            'shorthandedToi': _mmss(_seconds(texts[6])),
+        }
+        if texts[0] == 'TOT':
+            current['total'] = line
+        else:
+            current['periods'].append(line)
+    return players
 
 
 def roster_from_boxscore(boxscore: dict, side: str) -> dict[int, int]:

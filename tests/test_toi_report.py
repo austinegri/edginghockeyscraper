@@ -3,6 +3,8 @@
 import gzip
 import json
 import unittest
+from datetime import date
+from unittest import mock
 from collections import Counter
 from pathlib import Path
 
@@ -126,6 +128,109 @@ class TestParse(unittest.TestCase):
         with self.assertRaises(ValueError):
             toi_report.shifts_from_toi_reports(
                 _html(2024021235, 'H'), _html(2024021235, 'V'), _json('2009020068_boxscore.json.gz'))
+
+
+class TestSummary(unittest.TestCase):
+    """parse_toi_summary: the per-period table printed under each player's shifts."""
+
+    _GAMES = (2025020001, 2024021235, 2009020068, 2024010093)
+
+    def _summaries(self, game_id):
+        return {'home': toi_report.parse_toi_summary(_html(game_id, 'H')),
+                'away': toi_report.parse_toi_summary(_html(game_id, 'V'))}
+
+    def test_totals_match_the_shift_rows(self):
+        for game_id in self._GAMES:
+            box = _json(f'{game_id}_boxscore.json.gz')
+            for side in ('home', 'away'):
+                roster = toi_report.roster_from_boxscore(box, f'{side}Team')
+                numbers = {pid: n for n, pid in roster.items()}
+                html = _html(game_id, 'H' if side == 'home' else 'V')
+                toi = Counter()
+                for r in toi_report.parse_toi_report(html, game_id, box[f'{side}Team']['id'], roster):
+                    toi[numbers[r['playerId']]] += _seconds(r['duration'])
+                for p in toi_report.parse_toi_summary(html):
+                    with self.subTest(game_id=game_id, side=side, number=p['number']):
+                        self.assertEqual(_seconds(p['total']['toi']), toi[p['number']])
+
+    def test_periods_add_up_to_the_total_and_splits_to_the_toi(self):
+        for game_id in self._GAMES:
+            for side, players in self._summaries(game_id).items():
+                for p in players:
+                    with self.subTest(game_id=game_id, side=side, number=p['number']):
+                        total = p['total']
+                        self.assertIsNotNone(total)
+                        self.assertIsNone(total['period'])
+                        self.assertEqual(total['shifts'], sum(x['shifts'] for x in p['periods']))
+                        self.assertEqual(_seconds(total['toi']), sum(_seconds(x['toi']) for x in p['periods']))
+                        for line in p['periods'] + [total]:
+                            self.assertEqual(_seconds(line['toi']), _seconds(line['evenStrengthToi'])
+                                             + _seconds(line['powerPlayToi']) + _seconds(line['shorthandedToi']))
+
+    def test_totals_match_the_boxscore(self):
+        for game_id in self._GAMES:
+            box = _json(f'{game_id}_boxscore.json.gz')['playerByGameStats']
+            for side, players in self._summaries(game_id).items():
+                lines = {p['sweaterNumber']: p for g in ('forwards', 'defense', 'goalies')
+                         for p in box[f'{side}Team'].get(g, [])}
+                for p in players:
+                    b = lines[p['number']]
+                    with self.subTest(game_id=game_id, side=side, number=p['number']):
+                        self.assertLessEqual(abs(_seconds(p['total']['toi']) - _seconds(b['toi'])), 2)
+                        if 'shifts' in b:
+                            self.assertEqual(p['total']['shifts'], b['shifts'])
+
+    def test_every_player_who_played_has_a_summary(self):
+        for game_id in (2025020001, 2024010093):
+            box = _json(f'{game_id}_boxscore.json.gz')['playerByGameStats']
+            for side, players in self._summaries(game_id).items():
+                played = {p['sweaterNumber'] for g in ('forwards', 'defense', 'goalies')
+                          for p in box[f'{side}Team'].get(g, []) if _seconds(p['toi']) > 0}
+                with self.subTest(game_id=game_id, side=side):
+                    self.assertEqual({p['number'] for p in players}, played)
+
+    def test_exact_player(self):
+        # The player the shift-chart API drops for this game.
+        szturc = next(p for p in toi_report.parse_toi_summary(_html(2024010093, 'V')) if p['number'] == 96)
+        self.assertEqual(szturc['name'], 'SZTURC, GABRIEL')
+        self.assertEqual(szturc['total']['toi'], '11:53')
+        self.assertEqual(szturc['total']['shifts'], 15)
+        self.assertEqual([x['period'] for x in szturc['periods']], [1, 2, 3])
+
+    def test_overtime_period(self):
+        gostisbehere = next(p for p in toi_report.parse_toi_summary(_html(2024010093, 'H')) if p['number'] == 4)
+        self.assertEqual([x['period'] for x in gostisbehere['periods']], [1, 2, 3, 4])
+
+    def test_bilingual_report(self):
+        phillips = next(p for p in toi_report.parse_toi_summary(_html(2009020068, 'H')) if p['number'] == 4)
+        self.assertEqual(phillips['name'], 'PHILLIPS, CHRIS')
+        self.assertEqual(phillips['periods'][0], {'period': 1, 'shifts': 7, 'avgShift': '01:04', 'toi': '07:31',
+                                                  'evenStrengthToi': '05:46', 'powerPlayToi': '00:00',
+                                                  'shorthandedToi': '01:45'})
+        self.assertEqual(phillips['total']['toi'], '21:42')
+
+
+class TestFetch(unittest.TestCase):
+    """get_toi_report goes through util.get_session, so the game date decides caching."""
+
+    def _fetch(self, status, content=b'', **kwargs):
+        session = mock.Mock()
+        session.get.return_value = mock.Mock(status_code=status, content=content)
+        with mock.patch.object(toi_report, 'get_session', return_value=session) as get_session:
+            result = toi_report.get_toi_report(2024021235, home=True, **kwargs)
+        return result, get_session
+
+    def test_cached_by_game_date(self):
+        result, get_session = self._fetch(200, _html(2024021235, 'H'), game_date=date(2025, 4, 1))
+        get_session.assert_called_once_with(date(2025, 4, 1), False)
+        self.assertEqual(result, _html(2024021235, 'H'))
+
+    def test_uncached_without_a_date(self):
+        _, get_session = self._fetch(200, _html(2024021235, 'H'))
+        get_session.assert_called_once_with(None, False)
+
+    def test_unpublished_report_is_none(self):
+        self.assertIsNone(self._fetch(404)[0])
 
 
 if __name__ == '__main__':
