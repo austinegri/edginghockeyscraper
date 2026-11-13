@@ -3,18 +3,22 @@
 
 Run with: python3 -m unittest tests.test_session_reuse -v
 """
+import io
 import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import requests
+import urllib3
 from requests_cache import CachedSession, NEVER_EXPIRE
 from requests_cache.backends import SQLiteCache
+from urllib3 import HTTPResponse
 
 from src.edginghockeyscraper import edginghockeyscraper as ehs
 from src.edginghockeyscraper.util import util
@@ -84,9 +88,12 @@ class TestSessionReuse(_ScratchCaches):
         util.set_session_backend(SQLiteCache(str(self._tmp / 'inst')), 'unused')
         a = util.get_session(self.PAST)
         b = util.get_session(self.PAST)
-        self.assertIsInstance(a, CachedSession)
-        self.assertIsNot(a, b)
-        self.assertEqual(a.settings.expire_after, timedelta(days=30))
+        # Wrapped only for the settled-data check (test_cache_freshness); expiry stays on
+        # the session's own settings, which the wrapper leaves alone.
+        self.assertIsInstance(a._session, CachedSession)
+        self.assertIsNot(a._session, b._session)
+        self.assertFalse(a._apply_expiry)
+        self.assertEqual(a._session.settings.expire_after, timedelta(days=30))
 
 
 class TestPerCallExpiry(_ScratchCaches):
@@ -224,6 +231,122 @@ class TestFetchBackendDefaults(unittest.TestCase):
     def test_cpu_heavier_fetchers_keep_processes(self):
         self.assertEqual(self._backend_used(ehs.build_stints_season, 2024), 'process')
         self.assertEqual(self._backend_used(ehs.get_on_ice_players_with_play_by_play_season, 2024), 'process')
+
+
+class TestDefaultTimeout(_ScratchCaches):
+    """Every session's adapter sends with a timeout, so a stalled NHL response can't hang a fetch."""
+
+    def _timeouts_sent(self, session, **get_kwargs):
+        seen = []
+
+        def fake_send(adapter, request, **kwargs):
+            seen.append(kwargs.get('timeout'))
+            raw = HTTPResponse(body=io.BytesIO(b'{}'), status=200, preload_content=False,
+                               headers={'Content-Type': 'application/json'}, request_url=request.url)
+            return adapter.build_response(request, raw)
+
+        with patch.object(requests.adapters.HTTPAdapter, 'send', fake_send):
+            session.get('https://example.invalid/timeout', **get_kwargs)
+        return seen
+
+    def test_plain_session_gets_the_default(self):
+        self.assertEqual(self._timeouts_sent(util.get_session(None)), [util.DEFAULT_TIMEOUT])
+
+    def test_cached_and_permanent_sessions_get_the_default(self):
+        self.assertEqual(self._timeouts_sent(util.get_session(date.today() - timedelta(days=30))),
+                         [util.DEFAULT_TIMEOUT])
+        self.assertEqual(self._timeouts_sent(util.get_permanent_session()), [util.DEFAULT_TIMEOUT])
+
+    def test_callers_timeout_wins(self):
+        self.assertEqual(self._timeouts_sent(util.get_session(None), timeout=5), [5])
+
+    def test_default_is_two_seconds(self):
+        self.assertEqual(util.DEFAULT_TIMEOUT, 2)
+
+
+class TestRetryBackoff(unittest.TestCase):
+    """Request retries back off exponentially (util._RETRY)."""
+
+    def test_backoff_schedule(self):
+        retry = util._RETRY.new(backoff_jitter=0.0)
+        waits = []
+        for _ in range(util.RETRIES):
+            retry = retry.increment(method='GET', url='/x', error=urllib3.exceptions.ReadTimeoutError(None, '/x', 'slow'))
+            waits.append(retry.get_backoff_time())
+        self.assertEqual(waits, [0, 2, 4, 8, 16, 30])  # about a minute in all
+
+    def test_jitter_and_retry_after_cap(self):
+        self.assertEqual(util._RETRY.backoff_jitter, util.RETRY_JITTER)
+        self.assertEqual(util._RETRY.retry_after_max, 60)
+        self.assertEqual(set(util._RETRY.status_forcelist), {429, 500, 502, 503, 504})
+
+
+class _StallingServer:
+    """A local HTTP server whose first `stalls` responses take `stall` seconds to start."""
+
+    def __init__(self, stalls, stall):
+        import http.server
+        self.requests = 0
+        server_self = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                server_self.requests += 1
+                if server_self.requests <= stalls:
+                    threading.Event().wait(stall)  # not time.sleep: tests patch that to skip backoff
+                body = b'{"ok": true}'
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.url = f'http://127.0.0.1:{self.httpd.server_address[1]}/x'
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class TestTimeoutsAreRetried(unittest.TestCase):
+    """End to end through a util session: a stalled response times out and is retried."""
+
+    def setUp(self):
+        self._timeout = patch.object(util, 'DEFAULT_TIMEOUT', 0.2)
+        self._timeout.start()
+
+    def tearDown(self):
+        self._timeout.stop()
+
+    def test_recovers_after_a_stall(self):
+        server = _StallingServer(stalls=1, stall=1.0)
+        try:
+            response = util._prepare_session(requests.Session()).get(server.url)
+        finally:
+            server.close()
+        self.assertEqual(response.json(), {'ok': True})
+        self.assertEqual(server.requests, 2)
+
+    def test_gives_up_after_backing_off(self):
+        server = _StallingServer(stalls=100, stall=1.0)
+        with patch('urllib3.util.retry.time.sleep') as sleep:
+            try:
+                with self.assertRaises(requests.exceptions.ConnectionError):
+                    util._prepare_session(requests.Session()).get(server.url)
+            finally:
+                server.close()
+        self.assertEqual(server.requests, util.RETRIES + 1)
+        waits = [c.args[0] for c in sleep.call_args_list]
+        self.assertEqual([int(w) for w in waits], [2, 4, 8, 16, 30])  # the 0 s first retry doesn't sleep
+        self.assertTrue(all(0 <= w - int(w) < util.RETRY_JITTER for w in waits[:-1]))
 
 
 if __name__ == '__main__':
