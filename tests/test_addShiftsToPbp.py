@@ -183,9 +183,9 @@ class TestBuildPeriodShifts(unittest.TestCase):
         self.assertNotIn(7, player_ids)
         self.assertNotIn(None, player_ids)
 
-        # valid + duplicate row for player 1 both survive filtering here --
-        # dedup happens later, during the sweep (tested below)
-        self.assertEqual(player_ids.count(HOME_SKATER_1), 2)
+        # the valid and duplicate rows for player 1 are merged into one shift
+        # (_collapse_shifts), so stints and the sweep never see the duplicate
+        self.assertEqual(player_ids.count(HOME_SKATER_1), 1)
 
     def test_seconds_normalization(self):
         per_period = edginghockeyscraper._build_period_shifts(make_shifts_json())

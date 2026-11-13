@@ -95,6 +95,8 @@ def _build_period_shifts(shifts_json: dict, team_ids: set | None = None) -> Dict
     positive is a real shift with a bad end time (e.g. a goalie's full
     period written 00:00 -> 00:00, duration 20:00); it ends at start +
     duration instead.
+
+    Each player's duplicate and overlapping rows are merged (_collapse_shifts).
     """
     per_period: Dict[int, List[dict]] = defaultdict(list)
     for row in shifts_json.get("data", []):
@@ -118,54 +120,74 @@ def _build_period_shifts(shifts_json: dict, team_ids: set | None = None) -> Dict
         per_period[period].append(
             {"playerId": pid, "teamId": team_id, "start": start_s, "end": end_s}
         )
-    return per_period
+    return {period: _collapse_shifts(shifts) for period, shifts in per_period.items()}
+
+
+def _collapse_shifts(shifts: List[dict]) -> List[dict]:
+    """
+    One period's shifts with each player's duplicate and overlapping rows merged
+    into one shift spanning them.
+
+    The shift feed repeats rows (2024020022: the same shift listed twice) and
+    adds stray ones inside a real shift (2026020057: a goalie's full 3rd period
+    plus a 0:00-12:20 row). Left in, a player is counted twice in a stint and
+    stints split at the stray row's times. Shifts that only touch (one ends as
+    the next starts) stay separate, so stint boundaries at line changes don't
+    move. Output is sorted by (start, end, playerId).
+    """
+    by_player: Dict[Tuple[int, int], List[dict]] = defaultdict(list)
+    for s in shifts:
+        by_player[(s['playerId'], s['teamId'])].append(s)
+    out: List[dict] = []
+    for rows in by_player.values():
+        rows.sort(key=lambda s: (s['start'], s['end']))
+        current = dict(rows[0])
+        for s in rows[1:]:
+            if s['start'] < current['end']:
+                current['end'] = max(current['end'], s['end'])
+            else:
+                out.append(current)
+                current = dict(s)
+        out.append(current)
+    out.sort(key=lambda s: (s['start'], s['end'], s['playerId']))
+    return out
+
+
+def _lineup(shifts: List[dict], t: int, before_change: bool) -> Dict[int, int]:
+    """{playerId: teamId} on the ice at second `t` of a period.
+
+    A shift is [start, end] in seconds elapsed. At a second where lines change,
+    before_change=True gives the line coming off (shifts with start < t <= end),
+    False the line coming on (start <= t < end). Elsewhere both are the same.
+    """
+    if before_change:
+        return {s["playerId"]: s["teamId"] for s in shifts if s["start"] < t <= s["end"]}
+    return {s["playerId"]: s["teamId"] for s in shifts if s["start"] <= t < s["end"]}
 
 
 def _sweep_period(
     shifts: List[dict], events: List[Tuple[int, int, bool]]
 ) -> Dict[int, Dict[int, int]]:
     """
-    Sweep-line over a single period.
+    The players on the ice for each event of one period.
 
     shifts: list of {"playerId", "teamId", "start", "end"} for that period.
-    events: list of (original_index, time_in_seconds, is_stoppage), for that period,
-            SORTED by time_in_seconds.
+    events: list of (original_index, time_in_seconds, before_change), in any order.
+            before_change picks the outgoing line when the event falls on a second
+            where lines change (see _lineup, and build_on_ice for how it's chosen).
 
-    Returns {original_index: {playerId: teamId}} -- the players on the ice
-    at each event's timestamp.
+    Returns {original_index: {playerId: teamId}}. When the chosen side of a change
+    has nobody on (an event at the period's final second, after which no shift
+    continues; or the period-start marker, before which none had begun) the
+    other side is used.
 
-    Stoppage semantics: the NHL shift feed truncates every on-ice player's shift
-    at the stoppage timestamp (goal, penalty, icing, etc.), so a naive `<= t`
-    sweep would remove them before snapshotting the event.  For stoppage events
-    (identified by the next play being a faceoff) we therefore advance the sweep
-    only up to (but not including) t, keeping those players in the active set.
+    Each event is looked up on its own, so events at one second can take
+    different sides of a change in any order, and a player listed in two
+    overlapping rows is simply on the ice.
     """
-    changes = []
-    for s in shifts:
-        changes.append((s["start"], 1, s["playerId"], s["teamId"]))   # joins
-        changes.append((s["end"], -1, s["playerId"], s["teamId"]))    # leaves
-    # Stable time-ordering; ties between a "leave" and "join" at the same
-    # instant don't matter here since they involve different players and
-    # the active dict is keyed by playerId.
-    changes.sort(key=lambda c: c[0])
-
-    active: Dict[int, int] = {}          # playerId -> teamId, "on ice now"
     result: Dict[int, Dict[int, int]] = {}
-    ci, n = 0, len(changes)
-
-    for orig_idx, t, is_stoppage in events:
-        # Stoppages: process changes strictly before t so players whose shifts
-        # end exactly at the stoppage time are still counted as on-ice.
-        # All other events: include changes at exactly t (normal end-exclusive semantics).
-        cutoff = t if not is_stoppage else t - 1
-        while ci < n and changes[ci][0] <= cutoff:
-            _, delta, pid, tid = changes[ci]
-            if delta == 1:
-                active[pid] = tid
-            else:
-                active.pop(pid, None)
-            ci += 1
-        result[orig_idx] = dict(active)  # snapshot; don't leak a live reference
+    for orig_idx, t, before_change in events:
+        result[orig_idx] = _lineup(shifts, t, before_change) or _lineup(shifts, t, not before_change)
     return result
 
 
@@ -358,8 +380,9 @@ def get_on_ice_players_with_play_by_play(
     disable_cache: bool = False,
 ) -> dict:
     """
-    Fetch shift, play-by-play, and boxscore data for `game_id` (plus the HTML
-    time-on-ice reports when the game has no API shifts), and return the
+    Fetch shift, play-by-play, and boxscore data for `game_id` (shifts from
+    get_shifts_with_fallback: the HTML time-on-ice reports when the API has no
+    shifts or is missing a player), and return the
     play-by-play payload with an added 'onIce' block on every play, built by
     `build_on_ice`:
 
@@ -383,19 +406,94 @@ def get_on_ice_players_with_play_by_play(
     else:
         pbp = get_play_by_play(game_id, game_date, disable_cache)
 
-    shifts_json = get_shifts(game_id, game_date, disable_cache)
     boxscore = get_boxscore(game_id, game_date, disable_cache)
+    shifts_json = get_shifts_with_fallback(game_id, game_date, disable_cache, pbp=pbp, boxscore=boxscore)
+    return build_on_ice(pbp, shifts_json, boxscore)
 
-    # The shift-chart API has nothing for some games (all of 2009-10, a block
-    # of late 2024-25); the HTML time-on-ice reports still do.
-    toi_reports = None
-    if not _build_period_shifts(shifts_json, {pbp["homeTeam"]["id"], pbp["awayTeam"]["id"]}):
-        home_html = get_toi_report(game_id, home=True)
-        away_html = get_toi_report(game_id, home=False)
-        if home_html is not None and away_html is not None:
-            toi_reports = (home_html, away_html)
 
-    return build_on_ice(pbp, shifts_json, boxscore, toi_reports)
+def get_shifts_with_fallback(
+    game_id: int,
+    game_date: date | None = None,
+    disable_cache: bool = False,
+    pbp: dict | None = None,
+    boxscore: dict | None = None,
+) -> dict:
+    """
+    The game's shifts in the shiftcharts shape ({'data': [...], 'total': n}): from the
+    shift-chart API, or rebuilt from the HTML time-on-ice reports when the API can't
+    be used --
+
+      * it has no shifts for the game (all of 2009-10, 2024021235-2024021291,
+        2026020154-2026020203); or
+      * it is missing a player (2024010093: no shifts for Szturc), detected by his
+        team being a skater short of the plays' situationCode (has_missing_shift_data);
+        the report shifts are used if they agree with situationCode better.
+
+    Otherwise, or when the reports aren't published or don't parse, the API's shifts.
+    pbp / boxscore are fetched when not passed. The reports are fetched only when needed.
+    """
+    if pbp is None:
+        pbp = get_play_by_play(game_id, game_date, disable_cache)
+    shifts = get_shifts(game_id, game_date, disable_cache)
+    teams = {pbp["homeTeam"]["id"], pbp["awayTeam"]["id"]}
+    api_usable = bool(_build_period_shifts(shifts, teams))
+    if api_usable:
+        if boxscore is None:
+            boxscore = get_boxscore(game_id, game_date, disable_cache)
+        from_api = build_on_ice(pbp, shifts, boxscore)
+        if not has_missing_shift_data(from_api):
+            return shifts
+
+    home_html = get_toi_report(game_id, home=True, game_date=game_date, disable_cache=disable_cache)
+    away_html = get_toi_report(game_id, home=False, game_date=game_date, disable_cache=disable_cache)
+    if home_html is None or away_html is None:
+        return shifts
+    if boxscore is None:
+        boxscore = get_boxscore(game_id, game_date, disable_cache)
+    try:
+        report_shifts = shifts_from_toi_reports(home_html, away_html, boxscore)
+    except ValueError:
+        return shifts
+    if not api_usable:
+        return report_shifts
+    from_reports = build_on_ice(pbp, report_shifts, boxscore)
+    if len(situation_code_mismatches(from_reports)) < len(situation_code_mismatches(from_api)):
+        return report_shifts
+    return shifts
+
+#: Play details naming the players a play involves (servedBy is left out: the
+#: player serving a penalty can be on the bench).
+_EVENT_PLAYER_KEYS = (
+    "playerId", "hittingPlayerId", "hitteePlayerId", "shootingPlayerId", "blockingPlayerId",
+    "scoringPlayerId", "assist1PlayerId", "assist2PlayerId", "committedByPlayerId",
+    "drawnByPlayerId", "winningPlayerId", "losingPlayerId",
+)
+
+#: On a change on the fly, plays the HTML play-by-play credits to the line coming
+#: off when the play's own players don't decide it (giveaways 89%, takeaways 82% of
+#: such plays, 2024-27); every other play goes to the line coming on.
+_OUTGOING_ON_THE_FLY = {"giveaway", "takeaway"}
+
+
+def _event_players_came_off(play: dict, shifts: List[dict], t: int) -> bool:
+    """For a play with no faceoff at its second (a change on the fly, if lines change
+    then): True to give it the line coming off at `t`.
+
+    The line that includes all of the play's own players when only one does;
+    otherwise the line coming off for giveaways and takeaways, the line coming on
+    for everything else.
+    """
+    before, after = _lineup(shifts, t, True), _lineup(shifts, t, False)
+    if before == after:
+        return False
+    details = play.get("details", {})
+    players = {details[k] for k in _EVENT_PLAYER_KEYS if details.get(k)} & (set(before) | set(after))
+    if players:
+        in_before, in_after = players <= set(before), players <= set(after)
+        if in_before != in_after:
+            return in_before
+    return play.get("typeDescKey") in _OUTGOING_ON_THE_FLY
+
 
 def build_on_ice(
     pbp: dict,
@@ -426,24 +524,43 @@ def build_on_ice(
         period_shifts = _build_period_shifts(shifts_from_toi_reports(*toi_reports, boxscore), team_ids)
     players = _roster_players(pbp, boxscore)
 
-    # Bucket play-by-play events by period, keeping their original index
-    # so results can be written back afterward.
+    # Which side of a line change each play takes, when it falls on the second
+    # the lines change. The shift feed ends the outgoing line's shifts and starts
+    # the incoming line's at that second, so it can't say on its own:
+    #   * a play before the first faceoff at that second, in play-by-play order
+    #     (the shot, goal, penalty or stoppage that ended play), gets the line
+    #     coming off; the faceoff and plays after it get the line coming on --
+    #     the same split _build_stints_raw makes;
+    #   * with no faceoff at that second (a change on the fly), see
+    #     _event_players_came_off.
+    # Against the HTML play-by-play's on-ice lists on 63 games held out from
+    # choosing these rules (2025-27; 19,318 plays, 6,916 on a line-change second),
+    # this matches 98.6% of plays and 96.0% at line changes, vs 95.5% and 87.9% for
+    # the previous rule (outgoing line only when the very next play is a faceoff).
     plays = [dict(play) for play in pbp.get("plays", [])]
+    first_faceoff: Dict[Tuple[int, str], int] = {}
+    for i, play in enumerate(plays):
+        if play.get("typeDescKey") == "faceoff":
+            key = (play.get("periodDescriptor", {}).get("number"), play.get("timeInPeriod"))
+            first_faceoff.setdefault(key, i)
+
     events_by_period: Dict[int, List[Tuple[int, int, bool]]] = defaultdict(list)
     for i, play in enumerate(plays):
         period = play.get("periodDescriptor", {}).get("number")
         t = play.get("timeInPeriod")
         if period is None or not t:
             continue
-        next_play = plays[i + 1] if i + 1 < len(plays) else None
-        is_stoppage = (next_play or {}).get("typeDescKey") == "faceoff"
-        events_by_period[period].append((i, _mmss_to_seconds(t), is_stoppage))
+        t_s = _mmss_to_seconds(t)
+        faceoff = first_faceoff.get((period, t))
+        if faceoff is not None:
+            before_change = i < faceoff
+        else:
+            before_change = _event_players_came_off(play, period_shifts.get(period, []), t_s)
+        events_by_period[period].append((i, t_s, before_change))
 
     onice_by_index: Dict[int, Dict[int, int]] = {}
     for period, evs in events_by_period.items():
-        evs.sort(key=lambda e: e[1])  # sweep requires chronological order
-        shifts = period_shifts.get(period, [])
-        onice_by_index.update(_sweep_period(shifts, evs))
+        onice_by_index.update(_sweep_period(period_shifts.get(period, []), evs))
 
     for i, play in enumerate(plays):
         active = onice_by_index.get(i, {})
@@ -473,6 +590,83 @@ def build_on_ice(
         }
 
     return {**pbp, "plays": plays}
+
+
+#: A team short of its situationCode skater count on at least this many plays means
+#: the shifts are missing a player. Complete shift data falls short on 0-4 plays a
+#: game, all at stoppages (players changing as a penalty is called); 2024010093, with
+#: one player absent from the shift-chart API, falls short on 55.
+STRENGTH_SHORTFALL_THRESHOLD = 10
+
+#: Plays whose on-ice block isn't a game-state snapshot.
+_NO_STRENGTH_TYPES = {"period-start", "period-end", "game-end", "shootout-complete"}
+
+
+def on_ice_code(on_ice: dict) -> str:
+    """A play's 'onIce' block in situationCode form: away goalie, away skaters,
+    home skaters, home goalie -- '1551' is 5-on-5 with both goalies in."""
+    return (f"{int(on_ice['awayGoalie'] is not None)}{len(on_ice['awaySkaters'])}"
+            f"{len(on_ice['homeSkaters'])}{int(on_ice['homeGoalie'] is not None)}")
+
+
+def situation_code_mismatches(on_ice_pbp: dict) -> List[dict]:
+    """
+    Plays whose on-ice players disagree with the play's own situationCode.
+
+    on_ice_pbp: a play-by-play with 'onIce' blocks (build_on_ice /
+    get_on_ice_players_with_play_by_play). Plays without a 4-digit situationCode,
+    period/game boundary markers, and shootout plays are skipped.
+
+    Returns one dict per disagreeing play:
+        {'index', 'eventId', 'period', 'timeInPeriod', 'typeDescKey',
+         'situationCode', 'onIceCode', 'awaySkaterDiff', 'homeSkaterDiff'}
+    where a SkaterDiff is on-ice skaters minus situationCode skaters (-1: one short).
+
+    A few per game are normal: at a stoppage the shift data can already show the
+    next line, and the situationCode at a too-many-men call excludes the extra man.
+    A team short on many plays (see strength_shortfall) means missing shifts.
+    """
+    out: List[dict] = []
+    for i, play in enumerate(on_ice_pbp.get("plays", [])):
+        code = play.get("situationCode") or ""
+        on_ice = play.get("onIce")
+        period = play.get("periodDescriptor", {})
+        if (len(code) != 4 or not code.isdigit() or on_ice is None
+                or play.get("typeDescKey") in _NO_STRENGTH_TYPES or period.get("periodType") == "SO"):
+            continue
+        actual = on_ice_code(on_ice)
+        if actual == code:
+            continue
+        out.append({
+            "index": i,
+            "eventId": play.get("eventId"),
+            "period": period.get("number"),
+            "timeInPeriod": play.get("timeInPeriod"),
+            "typeDescKey": play.get("typeDescKey"),
+            "situationCode": code,
+            "onIceCode": actual,
+            "awaySkaterDiff": int(actual[1]) - int(code[1]),
+            "homeSkaterDiff": int(actual[2]) - int(code[2]),
+        })
+    return out
+
+
+def strength_shortfall(on_ice_pbp: dict) -> Dict[str, int]:
+    """{'away': n, 'home': n}: plays on which each team has fewer skaters on the ice
+    than the play's situationCode says."""
+    counts = {"away": 0, "home": 0}
+    for m in situation_code_mismatches(on_ice_pbp):
+        if m["awaySkaterDiff"] < 0:
+            counts["away"] += 1
+        if m["homeSkaterDiff"] < 0:
+            counts["home"] += 1
+    return counts
+
+
+def has_missing_shift_data(on_ice_pbp: dict, threshold: int = STRENGTH_SHORTFALL_THRESHOLD) -> bool:
+    """True when either team is a skater short of the situationCode on `threshold` or
+    more plays -- the signature of a player missing from the shift data."""
+    return max(strength_shortfall(on_ice_pbp).values()) >= threshold
 
 def _roster_players(pbp: dict, boxscore: dict | None = None) -> Dict[int, Player]:
     """
@@ -526,6 +720,8 @@ def _build_stints_raw(shifts_json: dict, pbp: dict) -> list[dict]:
         shifts_by_period[period].append(
             {'playerId': pid, 'teamId': tid, 'start': start_s, 'end': end_s}
         )
+
+    shifts_by_period = {period: _collapse_shifts(shifts) for period, shifts in shifts_by_period.items()}
 
     # --- parse events, tracking PBP order ---------------------------------
     # first_faceoff_pbp_idx[(period, time_s)] = index of the first faceoff
@@ -676,7 +872,9 @@ def _game_type_from_id(game_id: int) -> GameType | None:
 
 def _build_stints_for_game(game_id: int, game_date: date | None, disable_cache: bool) -> list[dict]:
     pbp    = get_play_by_play(game_id, game_date, disable_cache)
-    shifts = get_shifts(game_id, game_date, disable_cache)
+    # The API's shifts, or the HTML time-on-ice reports' when the API has none for
+    # the game or is missing a player (see get_shifts_with_fallback).
+    shifts = get_shifts_with_fallback(game_id, game_date, disable_cache, pbp=pbp)
     stints = _build_stints_raw(shifts, pbp)
     game_type = _game_type_from_id(game_id)
     for s in stints:
