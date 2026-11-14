@@ -525,6 +525,17 @@ def _check_player_stats(game: _Game, es: dict | None, pbp_counts: dict, pl_count
                         {'boxscore': round(b['faceoffWinningPctg'], 3), 'ES': round(pct, 3)})
 
 
+def _shift_bounds(r: dict) -> tuple[int, int]:
+    """(start, end) seconds of a shiftcharts-shaped row. A row whose end is at or before
+    its start but has a positive duration is a real shift with a misprinted end (a goalie's
+    whole overtime written 00:00 -> 00:00, duration 05:00); it ends at start + duration,
+    as the scraper reads it (edginghockeyscraper._build_period_shifts)."""
+    start, end = _sec(r['startTime']), _sec(r['endTime'])
+    if end <= start and r.get('duration'):
+        end = start + _sec(r['duration'])
+    return start, end
+
+
 def _shift_totals(game: _Game, shifts_json: dict | None) -> dict[tuple, tuple[int, int]]:
     """(side, number) -> (shift count, seconds) from shiftcharts-shaped rows.
 
@@ -541,7 +552,7 @@ def _shift_totals(game: _Game, shifts_json: dict | None) -> dict[tuple, tuple[in
         key = game.by_id.get(r['playerId'])
         if key is None:
             continue
-        intervals[key].append((r['period'], _sec(r['startTime']), _sec(r['endTime'])))
+        intervals[key].append((r['period'], *_shift_bounds(r)))
     totals: dict[tuple, tuple[int, int]] = {}
     for key, rows in intervals.items():
         merged: list[list[int]] = []
@@ -811,7 +822,7 @@ def _check_shifts(game: _Game, api: dict, reports: dict, out: _Collector) -> Non
             if r.get('typeCode') != 517 or not r.get('startTime') or not r.get('endTime'):
                 continue
             key = game.by_id.get(r['playerId'])
-            start, end = _sec(r['startTime']), _sec(r['endTime'])
+            start, end = _shift_bounds(r)
             if key is None or end <= start:
                 continue
             by_player[key][(r['period'], start, end)] += 1

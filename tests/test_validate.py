@@ -612,6 +612,21 @@ class TestShiftTotals(unittest.TestCase):
     def test_same_clock_in_another_period_is_another_shift(self):
         self.assertEqual(self._totals((1, '00:00', '00:40'), (2, '00:00', '00:40')), (2, 80))
 
+    def test_misprinted_end_is_read_from_the_duration(self):
+        # A goalie's overtime as the API writes it (2010020936): 00:00 -> 00:00, duration 05:00.
+        rows = [{'typeCode': 517, 'playerId': self.pid, 'period': 4, 'startTime': '00:00',
+                 'endTime': '00:00', 'duration': '05:00'}]
+        self.assertEqual(validate._shift_totals(self.game, {'data': rows})[self.key], (1, 300))
+
+    def test_misprinted_api_end_matches_the_report(self):
+        api = {'data': [{'typeCode': 517, 'playerId': self.pid, 'period': 4, 'startTime': '00:00',
+                         'endTime': '00:00', 'duration': '05:00'}]}
+        reports = {'data': [{'typeCode': 517, 'playerId': self.pid, 'period': 4, 'startTime': '00:00',
+                             'endTime': '05:00', 'duration': '05:00'}]}
+        out = validate._Collector()
+        validate._check_shifts(self.game, api, reports, out)
+        self.assertEqual(out.items, [])
+
 
 class TestStrengthSurplus(unittest.TestCase):
     """_check_strength_surplus on hand-built on-ice plays."""

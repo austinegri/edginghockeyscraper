@@ -25,8 +25,10 @@ all 2009-10:
   - players with no shifts in their team's report (108 player-games);
   - goalies with a stretch missing (e.g. Price, 2009020002, nothing from
     14:58 of the 2nd to 15:14 of the 3rd);
-  - two games where a sweater number in the report is missing from the
-    boxscore roster (raises ValueError).
+  - four games where a sweater number in the report is missing from the
+    boxscore roster (raises ValueError);
+  - a shift listed under a heading with no player name (4 games), which is
+    dropped.
 """
 from __future__ import annotations
 
@@ -140,6 +142,11 @@ def parse_toi_report(html: bytes, game_id: int, team_id: int, roster: dict[int, 
     the way shiftcharts reports it: start to the end of its period, then 0:00 to
     the end time in the next period (dropped when that end is 0:00). Both halves
     keep the report's shift number.
+
+    A whole period whose elapsed end is misprinted as 0:00 ('0:00 / 5:00 ->
+    0:00 / 0:00', duration 05:00, mostly a goalie's overtime) runs to the end of
+    the period, as the remaining clock says. Zero-length rows (the '20:00 ->
+    0:00' period-end markers) and shootout ('SO') rows are dropped.
     """
     parser = _Rows()
     parser.feed(html.decode('utf-8', errors='replace'))
@@ -165,9 +172,15 @@ def parse_toi_report(html: bytes, game_id: int, team_id: int, roster: dict[int, 
                 or '/' not in texts[2] or '/' not in texts[3]):
             continue
         player_id, first, last = player
+        if texts[1].upper() == 'SO':  # shootout attempts, not shifts (garbage clock times)
+            continue
         period = _period(texts[1])
         start = _seconds(texts[2].split('/')[0])
         end = _seconds(texts[3].split('/')[0])
+        if end == start and _seconds(texts[3].split('/')[1]) == 0:
+            # '0:00 / 5:00 -> 0:00 / 0:00', duration 05:00: a whole period (mostly a
+            # goalie's overtime) whose elapsed end is misprinted; the remaining clock is right.
+            end = period_seconds(game_id, period)
         if end >= start:
             pieces = [(period, start, end)]
         else:  # crosses the intermission
@@ -175,6 +188,8 @@ def parse_toi_report(html: bytes, game_id: int, team_id: int, roster: dict[int, 
             if end > 0:
                 pieces.append((period + 1, 0, end))
         for piece_period, piece_start, piece_end in pieces:
+            if piece_end == piece_start:  # e.g. '20:00 -> 0:00' at the end of a period
+                continue
             rows.append({
                 'gameId': game_id,
                 'playerId': player_id,

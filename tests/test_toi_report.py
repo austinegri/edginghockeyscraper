@@ -118,6 +118,35 @@ class TestParse(unittest.TestCase):
                           (20, 3, '19:33', '20:00', '00:27'),   # ends exactly at the horn
                           (21, 4, '04:40', '05:00', '00:20')])  # regular-season OT is 5:00
 
+    def test_whole_period_with_misprinted_end_runs_to_the_horn(self):
+        # A goalie's overtime (2009020019) and a full regulation period (2019030016): the
+        # elapsed end reads 0:00 but the remaining clock (0:00) and duration say the whole period.
+        html = (b'<table><tr><td class="playerHeading">35 TURCO, MARTY</td></tr>'
+                b'<tr><td>1</td><td>1</td><td>0:00 / 20:00</td><td>0:00 / 0:00</td><td>20:00</td><td></td></tr>'
+                b'<tr><td>4</td><td>OT</td><td>0:00 / 5:00</td><td>0:00 / 0:00</td><td>05:00</td><td></td></tr>'
+                b'</table>')
+        rows = toi_report.parse_toi_report(html, 2009020019, 25, {35: 8460612})
+        self.assertEqual([(r['period'], r['startTime'], r['endTime'], r['duration']) for r in rows],
+                         [(1, '00:00', '20:00', '20:00'), (4, '00:00', '05:00', '05:00')])
+
+    def test_zero_length_rows_are_dropped(self):
+        # '20:00 / 0:00 -> 0:00 / 20:00', duration 42:47 (2021020014): a period-end marker, not a shift.
+        html = (b'<table><tr><td class="playerHeading">29 DUNN, VINCE</td></tr>'
+                b'<tr><td>6</td><td>1</td><td>13:56 / 6:04</td><td>14:46 / 5:14</td><td>00:50</td><td></td></tr>'
+                b'<tr><td>7</td><td>1</td><td>20:00 / 0:00</td><td>0:00 / 20:00</td><td>42:47</td><td></td></tr>'
+                b'</table>')
+        rows = toi_report.parse_toi_report(html, 2021020014, 19, {29: 8478407})
+        self.assertEqual([r['shiftNumber'] for r in rows], [6])
+
+    def test_shootout_rows_are_skipped(self):
+        # 2021021028 lists shootout attempts as 'SO' rows with garbage clocks.
+        html = (b'<table><tr><td class="playerHeading">19 SMITH, JOHN</td></tr>'
+                b'<tr><td>18</td><td>OT</td><td>1:02 / 3:58</td><td>1:40 / 3:20</td><td>00:38</td><td></td></tr>'
+                b'<tr><td>19</td><td>SO</td><td>31:23 / 16:18</td><td>31:23 / 16:13</td><td>00:05</td><td></td></tr>'
+                b'</table>')
+        rows = toi_report.parse_toi_report(html, 2021021028, 10, {19: 8470000})
+        self.assertEqual([(r['shiftNumber'], r['period']) for r in rows], [(18, 4)])
+
     def test_unknown_sweater_number_raises(self):
         box = _json('2024021235_boxscore.json.gz')
         box['playerByGameStats']['homeTeam']['forwards'] = box['playerByGameStats']['homeTeam']['forwards'][1:]
